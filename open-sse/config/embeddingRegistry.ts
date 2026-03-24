@@ -102,6 +102,46 @@ export const EMBEDDING_PROVIDERS: Record<string, EmbeddingProvider> = {
     authHeader: "bearer",
     models: [{ id: "nvidia/nv-embedqa-e5-v5", name: "NV EmbedQA E5 v5", dimensions: 1024 }],
   },
+
+  openrouter: {
+    id: "openrouter",
+    baseUrl: "https://openrouter.ai/api/v1/embeddings",
+    authType: "apikey",
+    authHeader: "bearer",
+    models: [
+      {
+        id: "openai/text-embedding-3-small",
+        name: "OpenAI: Text Embedding 3 Small",
+        dimensions: 1536,
+      },
+      {
+        id: "openai/text-embedding-3-large",
+        name: "OpenAI: Text Embedding 3 Large",
+        dimensions: 3072,
+      },
+      {
+        id: "openai/text-embedding-ada-002",
+        name: "OpenAI: Text Embedding Ada 002",
+        dimensions: 1536,
+      },
+      { id: "qwen/qwen3-embedding-8b", name: "Qwen: Qwen3 Embedding 8B", dimensions: 3584 },
+      { id: "qwen/qwen3-embedding-4b", name: "Qwen: Qwen3 Embedding 4B", dimensions: 2048 },
+      { id: "qwen/qwen3-embedding-0.6b", name: "Qwen: Qwen3 Embedding 0.6B", dimensions: 896 },
+      { id: "google/gemini-embedding-001", name: "Google: Gemini Embedding 001", dimensions: 768 },
+      {
+        id: "mistralai/codestral-embed-2505",
+        name: "Mistral: Codestral Embed 2505",
+        dimensions: 1024,
+      },
+      { id: "mistralai/mistral-embed-2312", name: "Mistral: Mistral Embed 2312", dimensions: 1024 },
+      {
+        id: "nvidia/llama-nemotron-embed-vl-1b-v2:free",
+        name: "NVIDIA: Llama Nemotron Embed VL 1B V2 (free)",
+        dimensions: 2048,
+      },
+    ],
+  },
+  
 };
 
 /**
