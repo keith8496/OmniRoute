@@ -138,6 +138,38 @@ export const IMAGE_PROVIDERS = {
     ],
     supportedSizes: ["512x512", "768x768", "1024x1024"],
   },
+
+  openrouter: {
+    id: "openrouter",
+    baseUrl: "https://openrouter.ai/api/v1/chat/completions",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "openai",
+    models: [
+      {
+        id: "google/gemini-3-pro-image-preview",
+        name: "Google: Nano Banana Pro (Gemini 3 Pro Image Preview)",
+      },
+      { id: "google/gemini-2.5-flash-image", name: "Google: Nano Banana (Gemini 2.5 Flash Image)" },
+      {
+        id: "google/gemini-3.1-flash-image-preview",
+        name: "Google: Nano Banana 2 (Gemini 3.1 Flash Image Preview)",
+      },
+      { id: "bytedance-seed/seedream-4.5", name: "ByteDance Seed: Seedream 4.5" },
+      { id: "openai/gpt-5-image-mini", name: "OpenAI: GPT-5 Image Mini" },
+      { id: "openai/gpt-5-image", name: "OpenAI: GPT-5 Image" },
+      { id: "sourceful/riverflow-v2-fast", name: "Sourceful: Riverflow V2 Fast" },
+      { id: "sourceful/riverflow-v2-pro", name: "Sourceful: Riverflow V2 Pro" },
+      { id: "sourceful/riverflow-v2-fast-preview", name: "Sourceful: Riverflow V2 Fast Preview" },
+      { id: "sourceful/riverflow-v2-max-preview", name: "Sourceful: Riverflow V2 Max Preview" },
+      { id: "black-forest-labs/flux.2-klein-4b", name: "Black Forest Labs: FLUX.2 Klein 4B" },
+      { id: "black-forest-labs/flux.2-max", name: "Black Forest Labs: FLUX.2 Max" },
+      { id: "black-forest-labs/flux.2-flex", name: "Black Forest Labs: FLUX.2 Flex" },
+      { id: "black-forest-labs/flux.2-pro", name: "Black Forest Labs: FLUX.2 Pro" },
+    ],
+    supportedSizes: ["512x512", "768x768", "1024x1024"],
+  },
+  
 };
 
 /**
