@@ -106,7 +106,7 @@ export const EMBEDDING_PROVIDERS: Record<string, EmbeddingProvider> = {
   github: {
     id: "github",
     baseUrl: "https://models.github.ai/inference/embeddings",
-    authType: "apikey",
+    authType: "oauth",
     authHeader: "bearer",
     models: [{ id: "openai/text-embedding-3-small", name: "OpenAI: Text Embedding 3 Small", dimensions: 1536 }]
   },
