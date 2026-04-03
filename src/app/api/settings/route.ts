@@ -7,6 +7,8 @@ import { getRuntimePorts } from "@/lib/runtime/ports";
 import { updateSettingsSchema } from "@/shared/validation/settingsSchemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { setCliCompatProviders } from "../../../../open-sse/config/cliFingerprints";
+import { getConsistentMachineId } from "@/shared/utils/machineId";
+import { validateProxyUrl, upsertUpstreamProxyConfig } from "@/lib/db/upstreamProxy";
 
 export async function GET() {
   try {
@@ -18,16 +20,19 @@ export async function GET() {
       setCliCompatProviders(settings.cliCompatProviders as string[]);
     }
 
-    const enableRequestLogs = process.env.ENABLE_REQUEST_LOGS === "true";
     const runtimePorts = getRuntimePorts();
+    const cloudUrl = process.env.CLOUD_URL || process.env.NEXT_PUBLIC_CLOUD_URL || null;
+    const machineId = await getConsistentMachineId();
 
     return NextResponse.json({
       ...safeSettings,
-      enableRequestLogs,
       hasPassword: !!password || !!process.env.INITIAL_PASSWORD,
       runtimePorts,
       apiPort: runtimePorts.apiPort,
       dashboardPort: runtimePorts.dashboardPort,
+      cloudConfigured: Boolean(cloudUrl),
+      cloudUrl,
+      machineId,
     });
   } catch (error) {
     console.log("Error getting settings:", error);
@@ -98,6 +103,29 @@ export async function PATCH(request) {
 
     const settings = await updateSettings(body);
 
+    // Sync CLIProxyAPI settings to upstream_proxy_config table
+    const cpaUrl = rawBody.cliproxyapi_url as string | undefined;
+    const cpaFallback = rawBody.cliproxyapi_fallback_enabled as boolean | undefined;
+    if (cpaUrl && typeof cpaUrl === "string") {
+      const urlValidation = validateProxyUrl(cpaUrl);
+      if (urlValidation.valid === false) {
+        return NextResponse.json(
+          { error: `Invalid CLIProxyAPI URL: ${urlValidation.error}` },
+          { status: 400 }
+        );
+      }
+    }
+    if (cpaFallback !== undefined || cpaUrl !== undefined) {
+      const enabled =
+        cpaFallback ?? (settings as Record<string, unknown>).cliproxyapi_fallback_enabled;
+      const mode = enabled ? "fallback" : "native";
+      await upsertUpstreamProxyConfig({
+        providerId: "cliproxyapi",
+        mode,
+        enabled: !!enabled,
+      });
+    }
+
     // Clear health check log cache if that setting was updated
     if ("hideHealthCheckLogs" in body) {
       clearHealthCheckLogCache();
@@ -106,6 +134,12 @@ export async function PATCH(request) {
     // Sync CLI fingerprint providers to runtime cache
     if ("cliCompatProviders" in body) {
       setCliCompatProviders(body.cliCompatProviders || []);
+    }
+
+    // Sync cache control settings to runtime cache
+    if ("alwaysPreserveClientCache" in body) {
+      const { invalidateCacheControlSettingsCache } = await import("@/lib/cacheControlSettings");
+      invalidateCacheControlSettingsCache();
     }
 
     const { password, ...safeSettings } = settings;

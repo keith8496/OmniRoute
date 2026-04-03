@@ -55,6 +55,8 @@ import {
   handleGetSessionSnapshot,
   handleSyncPricing,
 } from "./tools/advancedTools.ts";
+import { memoryTools } from "./tools/memoryTools.ts";
+import { skillTools } from "./tools/skillTools.ts";
 import { normalizeQuotaResponse } from "../../src/shared/contracts/quota.ts";
 
 // ============ Configuration ============
@@ -210,6 +212,12 @@ async function handleGetHealth() {
               hitRate: toNumber(cacheStatsRaw.hitRate, 0),
             }
           : undefined,
+      cryptography: health.cryptography
+        ? {
+            status: toString(toRecord(health.cryptography).status, "missing_or_invalid"),
+            provider: toString(toRecord(health.cryptography).provider, "unknown"),
+          }
+        : undefined,
     };
 
     await logToolCall("omniroute_get_health", {}, result, Date.now() - start, true);
@@ -435,11 +443,11 @@ async function handleListModelsCatalog(args: { provider?: string; capability?: s
     let path = "/v1/models";
     let isProviderSpecific = false;
     let source = "local_catalog";
-    let warning = undefined;
+    let warning: string | undefined;
 
     if (args.provider && !args.capability) {
       // Use direct provider fetch to get real-time API status
-      path = `/api/providers/${encodeURIComponent(args.provider)}/models`;
+      path = `/api/providers/${encodeURIComponent(args.provider)}/models?excludeHidden=true`;
       isProviderSpecific = true;
     } else {
       const params = new URLSearchParams();
@@ -451,7 +459,7 @@ async function handleListModelsCatalog(args: { provider?: string; capability?: s
     const raw = toRecord(await omniRouteFetch(path));
 
     // If we used the direct provider endpoint
-    let rawModels = [];
+    let rawModels: unknown[] = [];
     if (isProviderSpecific) {
       rawModels = Array.isArray(raw.models) ? raw.models : [];
       source = typeof raw.source === "string" ? raw.source : "api";
@@ -716,6 +724,52 @@ export function createMcpServer(): McpServer {
       handleSyncPricing(syncPricingInput.parse(args))
     )
   );
+
+  // ── Memory Tools ──────────────────────────────
+  Object.values(memoryTools).forEach((toolDef) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(toolDef.name, async (args) => {
+        try {
+          const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+          // @ts-ignore: handler expected specific object
+          const result = await toolDef.handler(parsedArgs);
+          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+        }
+      })
+    );
+  });
+
+  // ── Skill Tools ──────────────────────────────
+  Object.values(skillTools).forEach((toolDef) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(toolDef.name, async (args) => {
+        try {
+          const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+          // @ts-ignore: handler expected specific object
+          const result = await toolDef.handler(parsedArgs);
+          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+        }
+      })
+    );
+  });
 
   return server;
 }

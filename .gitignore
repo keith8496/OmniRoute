@@ -5,6 +5,12 @@
 omnirouteCloud/
 omnirouteSite/
 
+# Root-level underscore-prefixed directories (private/draft — never commit)
+/_*/
+
+# Draft features documentation (internal only)
+docs/new-features/
+
 # dependencies
 node_modules/
 /.pnp
@@ -14,6 +20,7 @@ node_modules/
 !.yarn/plugins
 !.yarn/releases
 !.yarn/versions
+.data/
 
 # testing
 coverage/
@@ -50,6 +57,7 @@ next-env.d.ts
 
 # data and logs
 data/
+.data/
 logs/*
 
 # analysis directories (generated, not tracked)
@@ -88,6 +96,7 @@ docs/*
 !docs/AUTO-COMBO.md
 !docs/MCP-SERVER.md
 !docs/CLI-TOOLS.md
+!docs/COVERAGE_PLAN.md
 
 
 # open-sse tests
@@ -112,6 +121,7 @@ app.log
 
 # Backup directories
 app.__qa_backup/
+.app-build-backup-*/
 
 # Production standalone build (created by scripts/prepublish.mjs)
 # Conflicts with Next.js App Router detection in dev (root app/ shadows src/app/)
@@ -134,3 +144,18 @@ vscode-extension/
 
 # Compiled npm-package build artifact (not source, should not be in git)
 /app
+
+# IDEA
+.idea/
+
+# Local OpenCode agent config
+.config/
+
+# Empty/dangling files
+typescript
+
+# Gemini Antigravity agent data
+.gemini/
+
+# Superpowers plans/specs (internal tooling, not project code)
+docs/superpowers/

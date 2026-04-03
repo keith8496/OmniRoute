@@ -13,29 +13,21 @@ import {
   EmptyState,
 } from "@/shared/components";
 import Tooltip from "@/shared/components/Tooltip";
+import ModelRoutingSection from "@/shared/components/ModelRoutingSection";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useNotificationStore } from "@/store/notificationStore";
+import { ROUTING_STRATEGIES } from "@/shared/constants/routingStrategies";
 import { useTranslations } from "next-intl";
 
 // Validate combo name: letters, numbers, -, _, /, .
 const VALID_NAME_REGEX = /^[a-zA-Z0-9_/.-]+$/;
 
-const STRATEGY_OPTIONS = [
-  { value: "priority", labelKey: "priority", descKey: "priorityDesc", icon: "sort" },
-  { value: "weighted", labelKey: "weighted", descKey: "weightedDesc", icon: "percent" },
-  { value: "round-robin", labelKey: "roundRobin", descKey: "roundRobinDesc", icon: "autorenew" },
-  { value: "random", labelKey: "random", descKey: "randomDesc", icon: "shuffle" },
-  { value: "least-used", labelKey: "leastUsed", descKey: "leastUsedDesc", icon: "low_priority" },
-  { value: "cost-optimized", labelKey: "costOpt", descKey: "costOptimizedDesc", icon: "savings" },
-  {
-    value: "fill-first",
-    labelKey: "fillFirst",
-    descKey: "fillFirstDesc",
-    icon: "stacked_bar_chart",
-  },
-  { value: "p2c", labelKey: "p2c", descKey: "p2cDesc", icon: "compare_arrows" },
-  { value: "strict-random", labelKey: "strictRandom", descKey: "strictRandomDesc", icon: "casino" },
-];
+const STRATEGY_OPTIONS = ROUTING_STRATEGIES.map((strategy) => ({
+  value: strategy.value,
+  labelKey: strategy.labelKey,
+  descKey: strategy.combosDescKey,
+  icon: strategy.icon,
+}));
 
 const STRATEGY_GUIDANCE_FALLBACK = {
   priority: {
@@ -194,6 +186,9 @@ const COMBO_TEMPLATE_FALLBACK = {
   freeStackTitle: "Free Stack ($0)",
   freeStackDesc:
     "Round-robin across all free providers: Kiro, iFlow, Qwen, Gemini CLI. Zero cost, never stops.",
+  paidPremiumTitle: "Paid Premium",
+  paidPremiumDesc:
+    "Round-robin across paid subscriptions: Cursor, Antigravity. Top-tier models, distributed load.",
 };
 
 const COMBO_TEMPLATES = [
@@ -254,6 +249,21 @@ const COMBO_TEMPLATES = [
     suggestedName: "balanced-load",
     config: {
       maxRetries: 1,
+      retryDelayMs: 1000,
+      healthCheckEnabled: true,
+    },
+  },
+  {
+    id: "paid-premium",
+    icon: "workspace_premium",
+    titleKey: "templatePaidPremium",
+    descKey: "templatePaidPremiumDesc",
+    fallbackTitle: COMBO_TEMPLATE_FALLBACK.paidPremiumTitle,
+    fallbackDesc: COMBO_TEMPLATE_FALLBACK.paidPremiumDesc,
+    strategy: "round-robin",
+    suggestedName: "paid-premium",
+    config: {
+      maxRetries: 2,
       retryDelayMs: 1000,
       healthCheckEnabled: true,
     },
@@ -597,6 +607,9 @@ export default function CombosPage() {
           </div>
         </Card>
       )}
+
+      {/* Model Routing Rules (#563) */}
+      <ModelRoutingSection combos={combos} />
 
       {/* Combos List */}
       {combos.length === 0 ? (
@@ -1127,6 +1140,7 @@ function TestResultsView({ results }) {
       {results.results?.map((r, i) => (
         <div
           key={i}
+          title={r.error || undefined}
           className="flex items-center gap-2 text-xs px-2 py-1.5 rounded bg-black/[0.02] dark:bg-white/[0.02]"
         >
           <span
@@ -1425,22 +1439,31 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders }) {
   };
 
   const FREE_STACK_PRESET_MODELS = [
-    { model: "gc/gemini-3-flash-preview", weight: 0 },
+    { model: "gemini-cli/gemini-3-flash-preview", weight: 0 },
     { model: "kr/claude-sonnet-4.5", weight: 0 },
     { model: "if/kimi-k2-thinking", weight: 0 },
     { model: "if/qwen3-coder-plus", weight: 0 },
-    { model: "qw/qwen3-coder-plus", weight: 0 },
+    { model: "if/deepseek-v3.2", weight: 0 },
     { model: "nvidia/llama-3.3-70b-instruct", weight: 0 },
     { model: "groq/llama-3.3-70b-versatile", weight: 0 },
+  ];
+
+  const PAID_PREMIUM_PRESET_MODELS = [
+    { model: "cu/claude-4.6-opus-high", weight: 0 },
+    { model: "antigravity/claude-sonnet-4-6", weight: 0 },
+    { model: "cu/claude-4.6-sonnet-high", weight: 0 },
+    { model: "antigravity/gemini-3.1-pro-high", weight: 0 },
+    { model: "antigravity/gemini-3-pro-high", weight: 0 },
   ];
 
   const applyTemplate = (template) => {
     setStrategy(template.strategy);
     setConfig((prev) => ({ ...prev, ...template.config }));
     if (!name.trim()) setName(template.suggestedName);
-    // Pre-fill Free Stack with 7 real free provider models
     if (template.id === "free-stack") {
       setModels(FREE_STACK_PRESET_MODELS);
+    } else if (template.id === "paid-premium") {
+      setModels(PAID_PREMIUM_PRESET_MODELS);
     }
   };
 

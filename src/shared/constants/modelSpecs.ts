@@ -32,7 +32,7 @@ export const MODEL_SPECS: Record<string, ModelSpec> = {
 
   // ── Gemini 3.1 Pro High ─────────────────────────────────────────
   "gemini-3.1-pro-high": {
-    maxOutputTokens: 131072,
+    maxOutputTokens: 65535,
     contextWindow: 1048576,
     defaultThinkingBudget: 24576,
     thinkingBudgetCap: 32768,
@@ -40,12 +40,12 @@ export const MODEL_SPECS: Record<string, ModelSpec> = {
     supportsThinking: true,
     supportsTools: true,
     supportsVision: true,
-    aliases: ["gemini-3-pro-high"],
+    aliases: ["gemini-3-pro-high", "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools"],
   },
 
   // ── Gemini 3.1 Pro Low ──────────────────────────────────────────
   "gemini-3.1-pro-low": {
-    maxOutputTokens: 131072,
+    maxOutputTokens: 65535,
     contextWindow: 1048576,
     defaultThinkingBudget: 8192,
     thinkingBudgetCap: 16000,

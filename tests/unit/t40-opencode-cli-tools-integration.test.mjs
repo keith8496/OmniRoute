@@ -49,19 +49,33 @@ test("T40: OpenCode config generator includes endpoint and selected API key", ()
     apiKey: "sk_test_opencode",
     model: "claude-sonnet-4-5-thinking",
   });
-  assert.equal(providerConfig.baseURL, "http://localhost:20128/v1");
-  assert.equal(providerConfig.apiKey, "sk_test_opencode");
-  assert.ok(providerConfig.models.includes("claude-sonnet-4-5-thinking"));
+  assert.equal(providerConfig.options.baseURL, "http://localhost:20128/v1");
+  assert.equal(providerConfig.options.apiKey, "sk_test_opencode");
+  assert.ok(providerConfig.models["claude-sonnet-4-5-thinking"]);
 
   const mergedConfig = mergeOpenCodeConfig(
-    { providers: { custom: { name: "Custom Provider" } } },
+    { provider: { custom: { name: "Custom Provider" } } },
     {
       baseUrl: "http://localhost:20128/v1",
       apiKey: "sk_test_opencode",
       model: "claude-sonnet-4-5-thinking",
     }
   );
-  assert.ok(mergedConfig.providers.custom);
-  assert.equal(mergedConfig.providers.omniroute.baseURL, "http://localhost:20128/v1");
-  assert.equal(mergedConfig.providers.omniroute.apiKey, "sk_test_opencode");
+  assert.ok(mergedConfig.provider.custom);
+  assert.equal(mergedConfig.provider.omniroute.options.baseURL, "http://localhost:20128/v1");
+  assert.equal(mergedConfig.provider.omniroute.options.apiKey, "sk_test_opencode");
+});
+
+test("T40: Windsurf card documents current official limitations honestly", () => {
+  const windsurf = CLI_TOOLS.windsurf;
+  assert.ok(windsurf, "Windsurf tool card must exist");
+  assert.equal(windsurf.configType, "guide");
+
+  const notesText = (windsurf.notes || [])
+    .map((note) => note?.text || "")
+    .join(" ")
+    .toLowerCase();
+
+  assert.match(notesText, /byok/);
+  assert.match(notesText, /custom openai-compatible provider/);
 });

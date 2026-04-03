@@ -1,5 +1,6 @@
 import { getCorsOrigin } from "./cors.ts";
 import { ERROR_TYPES, DEFAULT_ERROR_MESSAGES } from "../config/constants.ts";
+import { normalizePayloadForLog } from "@/lib/logPayloads";
 
 /**
  * Build OpenAI-compatible error response body
@@ -91,14 +92,16 @@ export function parseAntigravityRetryTime(message) {
  * Parse upstream provider error response
  * @param {Response} response - Fetch response from provider
  * @param {string} provider - Provider name (for Antigravity-specific parsing)
- * @returns {Promise<{statusCode: number, message: string, retryAfterMs: number|null}>}
+ * @returns {Promise<{statusCode: number, message: string, retryAfterMs: number|null, responseBody: unknown}>}
  */
 export async function parseUpstreamError(response, provider = null) {
   let message = "";
   let retryAfterMs = null;
+  let responseBody = null;
 
   try {
     const text = await response.text();
+    responseBody = normalizePayloadForLog(text);
 
     // Try parse as JSON
     try {
@@ -109,6 +112,7 @@ export async function parseUpstreamError(response, provider = null) {
     }
   } catch {
     message = `Upstream error: ${response.status}`;
+    responseBody = { _rawText: message };
   }
 
   const messageStr = typeof message === "string" ? message : JSON.stringify(message);
@@ -118,10 +122,22 @@ export async function parseUpstreamError(response, provider = null) {
     retryAfterMs = parseAntigravityRetryTime(messageStr);
   }
 
+  // Also parse retry time for other providers (Qwen, etc.) with "quota will reset after XhYmZs" format
+  if (response.status === 429 && !retryAfterMs) {
+    retryAfterMs = parseAntigravityRetryTime(messageStr);
+  }
+
+  // Cap maximum retry time at 24 hours to prevent infinite wait
+  const MAX_RETRY_MS = 24 * 60 * 60 * 1000;
+  if (retryAfterMs && retryAfterMs > MAX_RETRY_MS) {
+    retryAfterMs = MAX_RETRY_MS;
+  }
+
   return {
     statusCode: response.status,
     message: messageStr,
     retryAfterMs,
+    responseBody,
   };
 }
 

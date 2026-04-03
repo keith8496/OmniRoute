@@ -69,6 +69,12 @@ export const getHealthOutput = z.object({
       hitRate: z.number(),
     })
     .optional(),
+  cryptography: z
+    .object({
+      status: z.enum(["healthy", "missing_or_invalid"]),
+      provider: z.string(),
+    })
+    .optional(),
 });
 
 export const getHealthTool: McpToolDefinition<typeof getHealthInput, typeof getHealthOutput> = {
@@ -392,6 +398,59 @@ export const listModelsCatalogTool: McpToolDefinition<
   auditLevel: "none",
   phase: 1,
   sourceEndpoints: ["/api/models/catalog", "/v1/models"],
+};
+
+// --- Tool 9: omniroute_web_search ---
+export const webSearchInput = z.object({
+  query: z
+    .string()
+    .min(1, "Query is required")
+    .max(1000, "Query must be 1000 characters or fewer")
+    .describe("The search query string"),
+  max_results: z
+    .number()
+    .int()
+    .min(1)
+    .max(20)
+    .default(5)
+    .describe("Maximum number of search results to return"),
+  search_type: z.enum(["web", "news"]).default("web").describe("Type of search to perform"),
+  provider: z
+    .string()
+    .optional()
+    .describe("Specific search provider to use (serper, brave, perplexity, exa, tavily)"),
+});
+
+export const webSearchOutput = z.object({
+  id: z.string(),
+  provider: z.string(),
+  query: z.string(),
+  results: z.array(
+    z.object({
+      title: z.string(),
+      url: z.string(),
+      display_url: z.string().optional(),
+      snippet: z.string(),
+      position: z.number().int().positive(),
+    })
+  ),
+  cached: z.boolean(),
+  usage: z.object({
+    queries_used: z.number().int().min(0),
+    search_cost_usd: z.number().min(0),
+  }),
+});
+
+export const webSearchTool: McpToolDefinition<typeof webSearchInput, typeof webSearchOutput> = {
+  name: "omniroute_web_search",
+  description:
+    "Performs a web search using OmniRoute's search gateway. Supports multiple providers (Serper, Brave, Perplexity, Exa, Tavily) with automatic failover. Returns search results with titles, URLs, snippets, and position data.",
+  inputSchema: webSearchInput,
+  outputSchema: webSearchOutput,
+  scopes: ["execute:search"],
+  auditLevel: "basic",
+  phase: 1,
+  sourceEndpoints: ["/v1/search"],
 };
 
 // ============ Phase 2: Advanced Tools (8) ============
@@ -806,11 +865,73 @@ export const syncPricingTool: McpToolDefinition<typeof syncPricingInput, typeof 
     sourceEndpoints: ["/api/pricing/sync"],
   };
 
+// ============ Cache Tools ============
+
+export const cacheStatsInput = z.object({}).describe("No parameters required");
+
+export const cacheStatsOutput = z.object({
+  semanticCache: z.object({
+    memoryEntries: z.number(),
+    dbEntries: z.number(),
+    hits: z.number(),
+    misses: z.number(),
+    hitRate: z.string(),
+    tokensSaved: z.number(),
+  }),
+  promptCache: z
+    .object({
+      totalRequests: z.number(),
+      requestsWithCacheControl: z.number(),
+      totalCachedTokens: z.number(),
+      totalCacheCreationTokens: z.number(),
+      estimatedCostSaved: z.number(),
+    })
+    .nullable(),
+  idempotency: z.object({
+    activeKeys: z.number(),
+    windowMs: z.number(),
+  }),
+});
+
+export const cacheStatsTool: McpToolDefinition<typeof cacheStatsInput, typeof cacheStatsOutput> = {
+  name: "omniroute_cache_stats",
+  description:
+    "Returns cache statistics including semantic cache hit rate, prompt cache metrics by provider, and idempotency layer stats.",
+  inputSchema: cacheStatsInput,
+  outputSchema: cacheStatsOutput,
+  scopes: ["read:cache"],
+  auditLevel: "basic",
+  phase: 2,
+  sourceEndpoints: ["/api/cache"],
+};
+
+export const cacheFlushInput = z.object({
+  signature: z.string().optional().describe("Specific cache signature to invalidate"),
+  model: z.string().optional().describe("Invalidate all entries for a specific model"),
+});
+
+export const cacheFlushOutput = z.object({
+  ok: z.boolean(),
+  invalidated: z.number().optional(),
+  scope: z.string().optional(),
+});
+
+export const cacheFlushTool: McpToolDefinition<typeof cacheFlushInput, typeof cacheFlushOutput> = {
+  name: "omniroute_cache_flush",
+  description:
+    "Flush cache entries. Provide signature to invalidate a single entry, model to invalidate all entries for a model, or omit both to clear all.",
+  inputSchema: cacheFlushInput,
+  outputSchema: cacheFlushOutput,
+  scopes: ["write:cache"],
+  auditLevel: "full",
+  phase: 2,
+  sourceEndpoints: ["/api/cache"],
+};
+
 // ============ Tool Registry ============
 
 /** All MCP tool definitions, ordered by phase then name */
 export const MCP_TOOLS = [
-  // Phase 1: Essential
   getHealthTool,
   listCombosTool,
   getComboMetricsTool,
@@ -819,7 +940,7 @@ export const MCP_TOOLS = [
   routeRequestTool,
   costReportTool,
   listModelsCatalogTool,
-  // Phase 2: Advanced
+  webSearchTool,
   simulateRouteTool,
   setBudgetGuardTool,
   setRoutingStrategyTool,
@@ -830,6 +951,8 @@ export const MCP_TOOLS = [
   explainRouteTool,
   getSessionSnapshotTool,
   syncPricingTool,
+  cacheStatsTool,
+  cacheFlushTool,
 ] as const;
 
 /** Essential tools only (Phase 1) */

@@ -12,6 +12,7 @@ import { runMigrations } from "./migrationRunner";
 
 type SqliteDatabase = import("better-sqlite3").Database;
 type JsonRecord = Record<string, unknown>;
+type CheckpointMode = "PASSIVE" | "FULL" | "RESTART" | "TRUNCATE";
 
 // ──────────────── Environment Detection ────────────────
 
@@ -173,7 +174,9 @@ const SCHEMA_SQL = `
     combo_name TEXT,
     request_body TEXT,
     response_body TEXT,
-    error TEXT
+    error TEXT,
+    artifact_relpath TEXT,
+    has_pipeline_details INTEGER DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS idx_cl_timestamp ON call_logs(timestamp);
   CREATE INDEX IF NOT EXISTS idx_cl_status ON call_logs(status);
@@ -321,6 +324,12 @@ function setDb(db: SqliteDatabase | null): void {
   }
 }
 
+function checkpointDb(db: SqliteDatabase, mode: CheckpointMode = "TRUNCATE"): boolean {
+  if (isCloud || isBuildPhase || !SQLITE_FILE) return false;
+  db.pragma(`wal_checkpoint(${mode})`);
+  return true;
+}
+
 function ensureProviderConnectionsColumns(db: SqliteDatabase) {
   try {
     const columns = db.prepare("PRAGMA table_info(provider_connections)").all() as Array<{
@@ -373,6 +382,27 @@ function ensureUsageHistoryColumns(db: SqliteDatabase) {
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn("[DB] Failed to verify usage_history schema:", message);
+  }
+}
+
+function ensureCallLogsColumns(db: SqliteDatabase) {
+  try {
+    const columns = db.prepare("PRAGMA table_info(call_logs)").all() as Array<{
+      name?: string;
+    }>;
+    const columnNames = new Set(columns.map((column) => String(column.name ?? "")));
+
+    if (!columnNames.has("artifact_relpath")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN artifact_relpath TEXT");
+      console.log("[DB] Added call_logs.artifact_relpath column");
+    }
+    if (!columnNames.has("has_pipeline_details")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN has_pipeline_details INTEGER DEFAULT 0");
+      console.log("[DB] Added call_logs.has_pipeline_details column");
+    }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn("[DB] Failed to verify call_logs schema:", message);
   }
 }
 
@@ -468,6 +498,7 @@ export function getDbInstance(): SqliteDatabase {
   db.exec(SCHEMA_SQL);
   ensureProviderConnectionsColumns(db);
   ensureUsageHistoryColumns(db);
+  ensureCallLogsColumns(db);
 
   // ── Versioned Migrations ──
   // Auto-seed 001 as applied (the inline SCHEMA_SQL already created these tables)
@@ -499,15 +530,39 @@ export function getDbInstance(): SqliteDatabase {
   return db;
 }
 
+export function closeDbInstance(options?: { checkpointMode?: CheckpointMode | null }): boolean {
+  const db = getDb();
+  if (!db) return false;
+
+  const checkpointMode = options?.checkpointMode ?? "TRUNCATE";
+
+  try {
+    if (checkpointMode) {
+      try {
+        if (checkpointDb(db, checkpointMode)) {
+          console.log(`[DB] SQLite WAL checkpoint completed (${checkpointMode}).`);
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[DB] WAL checkpoint failed during close (${checkpointMode}):`, message);
+      }
+    }
+  } finally {
+    try {
+      if (db.open) db.close();
+    } finally {
+      setDb(null);
+    }
+  }
+
+  return true;
+}
+
 /**
  * Reset the singleton (used by restore).
  */
 export function resetDbInstance() {
-  const db = getDb();
-  if (db) {
-    db.close();
-    setDb(null);
-  }
+  closeDbInstance();
 }
 
 // ──────────────── JSON → SQLite Migration ────────────────

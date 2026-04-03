@@ -20,6 +20,15 @@ import { supportsToolCalling } from "./modelCapabilities.ts";
 
 // Status codes that should mark semaphore + record circuit breaker failures
 const TRANSIENT_FOR_BREAKER = [429, 502, 503, 504];
+const COMBO_BAD_REQUEST_FALLBACK_PATTERNS = [
+  /\bprohibited_content\b/i,
+  /request blocked by .*api/i,
+  /provided message roles? is not valid/i,
+  /unsupported .*message role/i,
+  /no such tool available/i,
+  /unsupported content part type/i,
+  /tool(?:_call|_use)? .* not (?:available|found)/i,
+];
 
 const MAX_COMBO_DEPTH = 3;
 
@@ -35,6 +44,86 @@ const DEFAULT_MODEL_P95_MS = {
   "deepseek-chat": 2000,
 };
 const MIN_HISTORY_SAMPLES = 10;
+
+/**
+ * Validate that a successful (HTTP 200) non-streaming response actually contains
+ * meaningful content. Returns { valid: true } or { valid: false, reason }.
+ *
+ * Only inspects non-streaming JSON responses — streaming responses are passed through
+ * because buffering the full stream would defeat the purpose of streaming.
+ *
+ * Checks:
+ * 1. Body is valid JSON
+ * 2. Has at least one choice with non-empty content or tool_calls
+ */
+async function validateResponseQuality(
+  response: Response,
+  isStreaming: boolean,
+  log: { warn?: (...args: unknown[]) => void }
+): Promise<{ valid: boolean; reason?: string; clonedResponse?: Response }> {
+  if (isStreaming) return { valid: true };
+
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("application/json") && !contentType.includes("text/")) {
+    return { valid: true };
+  }
+
+  let cloned: Response;
+  try {
+    cloned = response.clone();
+  } catch {
+    return { valid: true };
+  }
+
+  let text: string;
+  try {
+    text = await cloned.text();
+  } catch {
+    return { valid: true };
+  }
+
+  if (!text || text.trim().length === 0) {
+    return { valid: false, reason: "empty response body" };
+  }
+
+  let json: Record<string, unknown>;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    if (text.startsWith("data:")) return { valid: true };
+    return { valid: false, reason: "response is not valid JSON" };
+  }
+
+  const choices = json?.choices;
+  if (!Array.isArray(choices) || choices.length === 0) {
+    if (json?.output || json?.result || json?.data || json?.response) return { valid: true };
+    if (json?.error) {
+      const err = json.error as Record<string, unknown>;
+      return {
+        valid: false,
+        reason: `upstream error in 200 body: ${err?.message || JSON.stringify(json.error).substring(0, 200)}`,
+      };
+    }
+    return { valid: true };
+  }
+
+  const firstChoice = choices[0];
+  const message = firstChoice?.message || firstChoice?.delta;
+  if (!message) {
+    return { valid: false, reason: "choice has no message object" };
+  }
+
+  const content = message.content;
+  const toolCalls = message.tool_calls;
+  const hasContent = content !== null && content !== undefined && content !== "";
+  const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+
+  if (!hasContent && !hasToolCalls) {
+    return { valid: false, reason: "empty content and no tool_calls in response" };
+  }
+
+  return { valid: true };
+}
 
 // In-memory atomic counter per combo for round-robin distribution
 // Resets on server restart (by design — no stale state)
@@ -258,6 +347,12 @@ function extractPromptForIntent(body) {
   return "";
 }
 
+export function shouldFallbackComboBadRequest(status, errorText) {
+  if (status !== 400 || !errorText) return false;
+  const message = String(errorText);
+  return COMBO_BAD_REQUEST_FALLBACK_PATTERNS.some((pattern) => pattern.test(message));
+}
+
 function mapIntentToTaskType(intent) {
   switch (intent) {
     case "code":
@@ -449,14 +544,23 @@ export async function handleComboChat({
         const res = await handleSingleModel(b, modelStr);
         if (!res.ok) return res;
 
-        // Non-streaming: inject tag into JSON response (existing logic)
+        // Non-streaming: inject tag into JSON response
+        // Fix #721: Use OpenAI choices format (json.choices[0].message) not json.messages
         if (!b.stream) {
           try {
             const json = await res.clone().json();
-            const msgs = Array.isArray(json?.messages) ? json.messages : [];
-            if (msgs.length > 0) {
-              const tagged = injectModelTag(msgs, modelStr);
-              return new Response(JSON.stringify({ ...json, messages: tagged }), {
+            const choice = json?.choices?.[0];
+            if (choice?.message) {
+              // Wrap single message in array for injectModelTag, then unwrap
+              const tagged = injectModelTag([choice.message], modelStr);
+              // If the message had tool_calls but no string content, injectModelTag
+              // appends a synthetic assistant message — use the last one
+              const taggedMsg = tagged[tagged.length - 1];
+              const updatedJson = {
+                ...json,
+                choices: [{ ...choice, message: taggedMsg }, ...(json.choices?.slice(1) || [])],
+              };
+              return new Response(JSON.stringify(updatedJson), {
                 status: res.status,
                 headers: res.headers,
               });
@@ -487,8 +591,9 @@ export async function handleComboChat({
 
             const text = decoder.decode(chunk, { stream: true });
 
-            // Look for the first SSE data line with non-empty content
-            // Pattern: "content":"<non-empty>" — we inject tag at the start
+            // Fix #721: Look for either non-empty content OR tool_calls in the
+            // SSE data. Tool-call-only responses have content:null, so we inject
+            // the tag when we see a finish_reason approaching, or on first content.
             const contentMatch = text.match(/"content":"([^"]+)/);
             if (contentMatch) {
               // Inject tag at the beginning of the first content value
@@ -498,6 +603,27 @@ export async function handleComboChat({
               );
               tagInjected = true;
               controller.enqueue(encoder.encode(injected));
+              return;
+            }
+
+            // Fix #721: For tool-call-only streams, inject the tag when we see
+            // the finish_reason chunk (before it reaches the client SDK which
+            // would close the connection). This ensures the tag roundtrips
+            // through the conversation history even when there's no text content.
+            if (text.includes('"finish_reason"') && !text.includes('"finish_reason":null')) {
+              // Inject a content chunk with the tag just before this finish chunk
+              const tagChunk = `data: ${JSON.stringify({
+                choices: [
+                  {
+                    delta: { content: tagContent },
+                    index: 0,
+                    finish_reason: null,
+                  },
+                ],
+              })}\n\n`;
+              tagInjected = true;
+              controller.enqueue(encoder.encode(tagChunk));
+              controller.enqueue(chunk);
               return;
             }
 
@@ -522,14 +648,60 @@ export async function handleComboChat({
           },
         });
 
-        const transformedStream = res.body.pipeThrough(transform);
+        // FIX #585: Sanitize outbound stream — strip <omniModel> tags from
+        // visible content so they don't leak to the user. The tag is still
+        // present in the full response for round-trip context pinning, but
+        // we clean it from each SSE chunk's content field before delivery.
+        //
+        // IMPORTANT: Use a SEPARATE TextDecoder from the transform stream above.
+        // The transform stream's decoder accumulates UTF-8 state; reusing it here
+        // would corrupt multi-byte characters split across chunk boundaries.
+        const sanitizeDecoder = new TextDecoder();
+        const sanitize = new TransformStream({
+          transform(chunk, controller) {
+            const text = sanitizeDecoder.decode(chunk, { stream: true });
+            if (text) {
+              if (text.includes("<omniModel>")) {
+                const cleaned = text.replace(/\n?<omniModel>[^<]+<\/omniModel>\n?/g, "");
+                if (cleaned) controller.enqueue(encoder.encode(cleaned));
+              } else {
+                controller.enqueue(encoder.encode(text));
+              }
+            }
+          },
+          flush(controller) {
+            const tail = sanitizeDecoder.decode();
+            if (tail) {
+              if (tail.includes("<omniModel>")) {
+                const cleaned = tail.replace(/\n?<omniModel>[^<]+<\/omniModel>\n?/g, "");
+                if (cleaned) controller.enqueue(encoder.encode(cleaned));
+              } else {
+                controller.enqueue(encoder.encode(tail));
+              }
+            }
+          },
+        });
+
+        const transformedStream = res.body.pipeThrough(transform).pipeThrough(sanitize);
+        // Add model info as response header for clients that support it
+        const headers = new Headers(res.headers);
+        headers.set("X-OmniRoute-Model", modelStr);
         return new Response(transformedStream, {
           status: res.status,
-          headers: res.headers,
+          headers,
         });
       }
     : handleSingleModel;
   // ─────────────────────────────────────────────────────────────────────────
+
+  // Route to pinned model if context caching specifies one (Fix #679)
+  if (pinnedModel) {
+    log.info(
+      "COMBO",
+      `Bypassing strategy — routing directly to pinned context model: ${pinnedModel}`
+    );
+    return handleSingleModelWrapped(body, pinnedModel);
+  }
 
   // Route to round-robin handler if strategy matches
   if (strategy === "round-robin") {
@@ -640,6 +812,16 @@ export async function handleComboChat({
     const modePack =
       typeof autoConfigSource.modePack === "string" ? autoConfigSource.modePack : undefined;
 
+    // Retrieve last known good provider (LKGP) for this combo/model (#919)
+    let lastKnownGoodProvider: string | undefined;
+    try {
+      const { getLKGP } = await import("../../src/lib/localDb");
+      const lkgp = await getLKGP(combo.name, combo.id || combo.name);
+      if (lkgp) lastKnownGoodProvider = lkgp;
+    } catch (err) {
+      log.warn("COMBO", "Failed to retrieve Last Known Good Provider. This is non-fatal.", { err });
+    }
+
     const candidates = await buildAutoCandidates(eligibleModels, combo.name);
     if (candidates.length > 0) {
       let selectedProvider = null;
@@ -650,7 +832,7 @@ export async function handleComboChat({
         try {
           const decision = selectWithStrategy(
             candidates,
-            { taskType, requestHasTools },
+            { taskType, requestHasTools, lastKnownGoodProvider },
             routingStrategy
           );
           selectedProvider = decision.provider;
@@ -780,20 +962,49 @@ export async function handleComboChat({
 
       const result = await handleSingleModelWrapped(body, modelStr);
 
-      // Success — return response
+      // Success — validate response quality before returning
       if (result.ok) {
+        const quality = await validateResponseQuality(result, !!body.stream, log);
+        if (!quality.valid) {
+          log.warn(
+            "COMBO",
+            `Model ${modelStr} returned 200 but failed quality check: ${quality.reason}`
+          );
+          breaker._onFailure();
+          recordComboRequest(combo.name, modelStr, {
+            success: false,
+            latencyMs: Date.now() - startTime,
+            fallbackCount,
+            strategy,
+          });
+          if (i > 0) fallbackCount++;
+          break; // move to next model
+        }
         resolvedByModel = modelStr;
         const latencyMs = Date.now() - startTime;
         log.info(
           "COMBO",
           `Model ${modelStr} succeeded (${latencyMs}ms, ${fallbackCount} fallbacks)`
         );
+        breaker._onSuccess();
         recordComboRequest(combo.name, modelStr, {
           success: true,
           latencyMs,
           fallbackCount,
           strategy,
         });
+
+        // Record last known good provider (LKGP) for this combo/model (#919)
+        if (provider) {
+          import("../../src/lib/localDb")
+            .then(({ setLKGP }) => setLKGP(combo.name, combo.id || combo.name, provider))
+            .catch((err) =>
+              log.warn("COMBO", "Failed to record Last Known Good Provider. This is non-fatal.", {
+                err,
+              })
+            );
+        }
+
         return result;
       }
 
@@ -803,17 +1014,16 @@ export async function handleComboChat({
       try {
         const cloned = result.clone();
         try {
-          const errorBody = await cloned.json();
-          errorText =
-            errorBody?.error?.message || errorBody?.error || errorBody?.message || errorText;
-          retryAfter = errorBody?.retryAfter || null;
-        } catch {
-          try {
-            const text = await result.text();
-            if (text) errorText = text.substring(0, 500);
-          } catch {
-            /* Body consumed */
+          const text = await cloned.text();
+          if (text) {
+            errorText = text.substring(0, 500);
+            const errorBody = JSON.parse(text);
+            errorText =
+              errorBody?.error?.message || errorBody?.error || errorBody?.message || errorText;
+            retryAfter = errorBody?.retryAfter || null;
           }
+        } catch {
+          /* Clone parse failed */
         }
       } catch {
         /* Clone failed */
@@ -844,15 +1054,23 @@ export async function handleComboChat({
         provider,
         result.headers
       );
+      const comboBadRequestFallback = shouldFallbackComboBadRequest(result.status, errorText);
 
       // Record failure in circuit breaker for transient errors
       if (TRANSIENT_FOR_BREAKER.includes(result.status)) {
         breaker._onFailure();
       }
 
-      if (!shouldFallback) {
+      if (!shouldFallback && !comboBadRequestFallback) {
         log.warn("COMBO", `Model ${modelStr} failed (no fallback)`, { status: result.status });
         return result;
+      }
+
+      if (comboBadRequestFallback) {
+        log.info(
+          "COMBO",
+          `Treating provider-scoped 400 from ${modelStr} as model-local failure; trying next combo target`
+        );
       }
 
       // Check if this is a transient error worth retrying on same model
@@ -1039,13 +1257,30 @@ async function handleRoundRobinCombo({
 
         const result = await handleSingleModel(body, modelStr);
 
-        // Success
+        // Success — validate response quality before returning
         if (result.ok) {
+          const quality = await validateResponseQuality(result, !!body.stream, log);
+          if (!quality.valid) {
+            log.warn(
+              "COMBO-RR",
+              `${modelStr} returned 200 but failed quality check: ${quality.reason}`
+            );
+            breaker._onFailure();
+            recordComboRequest(combo.name, modelStr, {
+              success: false,
+              latencyMs: Date.now() - startTime,
+              fallbackCount,
+              strategy: "round-robin",
+            });
+            if (offset > 0) fallbackCount++;
+            break; // move to next model
+          }
           const latencyMs = Date.now() - startTime;
           log.info(
             "COMBO-RR",
             `${modelStr} succeeded (${latencyMs}ms, ${fallbackCount} fallbacks)`
           );
+          breaker._onSuccess();
           recordComboRequest(combo.name, modelStr, {
             success: true,
             latencyMs,
@@ -1061,17 +1296,16 @@ async function handleRoundRobinCombo({
         try {
           const cloned = result.clone();
           try {
-            const errorBody = await cloned.json();
-            errorText =
-              errorBody?.error?.message || errorBody?.error || errorBody?.message || errorText;
-            retryAfter = errorBody?.retryAfter || null;
-          } catch {
-            try {
-              const text = await result.text();
-              if (text) errorText = text.substring(0, 500);
-            } catch {
-              /* Body consumed */
+            const text = await cloned.text();
+            if (text) {
+              errorText = text.substring(0, 500);
+              const errorBody = JSON.parse(text);
+              errorText =
+                errorBody?.error?.message || errorBody?.error || errorBody?.message || errorText;
+              retryAfter = errorBody?.retryAfter || null;
             }
+          } catch {
+            /* Clone parse failed */
           }
         } catch {
           /* Clone failed */
@@ -1100,6 +1334,7 @@ async function handleRoundRobinCombo({
           provider,
           result.headers
         );
+        const comboBadRequestFallback = shouldFallbackComboBadRequest(result.status, errorText);
 
         // Transient errors → mark in semaphore AND record circuit breaker failure
         if (TRANSIENT_FOR_BREAKER.includes(result.status) && cooldownMs > 0) {
@@ -1111,9 +1346,16 @@ async function handleRoundRobinCombo({
           );
         }
 
-        if (!shouldFallback) {
+        if (!shouldFallback && !comboBadRequestFallback) {
           log.warn("COMBO-RR", `${modelStr} failed (no fallback)`, { status: result.status });
           return result;
+        }
+
+        if (comboBadRequestFallback) {
+          log.info(
+            "COMBO-RR",
+            `Treating provider-scoped 400 from ${modelStr} as model-local failure; trying next model`
+          );
         }
 
         // Transient error → retry same model

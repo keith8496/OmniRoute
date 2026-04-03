@@ -48,6 +48,7 @@ export default function HealthPage() {
   const [telemetry, setTelemetry] = useState(null);
   const [cache, setCache] = useState(null);
   const [signatureCache, setSignatureCache] = useState(null);
+  const [degradation, setDegradation] = useState(null);
   const [resetting, setResetting] = useState(false);
 
   const fetchHealth = useCallback(async () => {
@@ -69,12 +70,14 @@ export default function HealthPage() {
       fetch("/api/telemetry/summary").then((r) => r.json()),
       fetch("/api/cache/stats").then((r) => r.json()),
       fetch("/api/rate-limits").then((r) => r.json()),
+      fetch("/api/health/degradation").then((r) => r.json()),
     ]);
     if (results[0].status === "fulfilled") setTelemetry(results[0].value);
     if (results[1].status === "fulfilled") setCache(results[1].value);
     if (results[2].status === "fulfilled" && results[2].value.cacheStats) {
       setSignatureCache(results[2].value.cacheStats);
     }
+    if (results[3].status === "fulfilled") setDegradation(results[3].value);
   }, []);
 
   useEffect(() => {
@@ -134,7 +137,7 @@ export default function HealthPage() {
     );
   }
 
-  const { system, providerHealth, rateLimitStatus, lockouts } = data;
+  const { system, providerHealth, providerSummary, rateLimitStatus, lockouts } = data;
   const cbEntries = Object.entries(providerHealth || {});
   const lockoutEntries = Object.entries(lockouts || {});
 
@@ -235,14 +238,114 @@ export default function HealthPage() {
             </div>
             <span className="text-sm text-text-muted">{t("providers")}</span>
           </div>
-          <p className="text-xl font-semibold text-text-main">{cbEntries.length}</p>
-          <p className="text-xs text-text-muted mt-1">
-            {t("healthyCount", {
-              count: cbEntries.filter(([, v]: [string, any]) => v.state === "CLOSED").length,
+          <p className="text-xl font-semibold text-text-main">
+            {providerSummary?.configuredCount ?? cbEntries.length}
+          </p>
+          <p
+            className="text-[11px] text-text-muted mt-1 inline-flex items-center gap-1"
+            title={t("configuredProvidersHint")}
+          >
+            {t("configuredProvidersLabel")}
+            <span className="material-symbols-outlined text-[12px]" aria-hidden="true">
+              help
+            </span>
+          </p>
+          <p
+            className="text-xs text-text-muted inline-flex items-center gap-1"
+            title={t("activeProvidersHint")}
+          >
+            {t("activeProviders", { count: providerSummary?.activeCount ?? 0 })}
+            <span className="material-symbols-outlined text-[12px]" aria-hidden="true">
+              info
+            </span>
+          </p>
+          <p
+            className="text-xs text-text-muted inline-flex items-center gap-1"
+            title={t("monitoredProvidersHint")}
+          >
+            {t("monitoredProviders", {
+              count: providerSummary?.monitoredCount ?? cbEntries.length,
             })}
+            <span className="material-symbols-outlined text-[12px]" aria-hidden="true">
+              info
+            </span>
           </p>
         </Card>
       </div>
+
+      {/* Graceful Degradation Status */}
+      {degradation && degradation.features && degradation.features.length > 0 && (
+        <Card className="p-5" role="region" aria-label="Graceful Degradation Status">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold text-text-main flex items-center gap-2">
+              <span className="material-symbols-outlined text-[20px] text-primary">healing</span>
+              Graceful Degradation Status
+            </h2>
+            <div className="flex items-center gap-3 text-xs text-text-muted font-medium">
+              <span className="px-2 py-0.5 rounded bg-green-500/10 text-green-400">
+                Full: {degradation.summary.full}
+              </span>
+              <span className="px-2 py-0.5 rounded bg-amber-500/10 text-amber-500">
+                Reduced: {degradation.summary.reduced}
+              </span>
+              <span className="px-2 py-0.5 rounded bg-orange-500/10 text-orange-500">
+                Minimal: {degradation.summary.minimal}
+              </span>
+              <span className="px-2 py-0.5 rounded bg-red-500/10 text-red-500">
+                Default: {degradation.summary.default}
+              </span>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {degradation.features.map((feat: any) => {
+              const bg =
+                feat.level === "full"
+                  ? "bg-green-500/5 border-green-500/10"
+                  : feat.level === "reduced"
+                    ? "bg-amber-500/5 border-amber-500/20"
+                    : feat.level === "minimal"
+                      ? "bg-orange-500/5 border-orange-500/20"
+                      : "bg-red-500/5 border-red-500/20";
+              const dot =
+                feat.level === "full"
+                  ? "bg-green-500"
+                  : feat.level === "reduced"
+                    ? "bg-amber-500"
+                    : feat.level === "minimal"
+                      ? "bg-orange-500"
+                      : "bg-red-500";
+              return (
+                <div
+                  key={feat.feature}
+                  className={`rounded-lg p-3 border \${bg} flex flex-col gap-2`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-semibold capitalize flex items-center gap-2 text-[var(--text-primary,#fff)]">
+                      <span className={`w-2 h-2 rounded-full \${dot}`}></span>
+                      {feat.feature}
+                    </span>
+                    <span className="text-xs uppercase tracking-wider font-bold opacity-70">
+                      {feat.level}
+                    </span>
+                  </div>
+                  <div className="text-xs text-[var(--text-secondary,#aaa)]">{feat.capability}</div>
+                  {feat.reason && (
+                    <div
+                      className="text-[10px] text-red-300 mt-1 bg-red-900/20 p-1.5 rounded"
+                      title={feat.reason}
+                    >
+                      {feat.reason.length > 80 ? feat.reason.substring(0, 80) + "..." : feat.reason}
+                    </div>
+                  )}
+                  <div className="text-[10px] text-[var(--text-muted,#666)] text-right mt-1">
+                    Since {new Date(feat.since).toLocaleTimeString()}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
 
       {/* Telemetry Cards — Latency & Prompt Cache */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">

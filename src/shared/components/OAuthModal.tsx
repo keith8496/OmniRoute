@@ -211,6 +211,8 @@ export default function OAuthModal({
         return;
       }
 
+      let forceManual = false;
+
       // Codex: on localhost use callback server on port 1455,
       // on remote use standard auth code flow (callback server is unreachable)
       if (provider === "codex") {
@@ -223,7 +225,12 @@ export default function OAuthModal({
 
             setAuthData({ ...serverData, redirectUri: serverData.redirectUri });
             setStep("waiting");
-            window.open(serverData.authUrl, "oauth_auth");
+            popupRef.current = window.open(serverData.authUrl, "oauth_auth");
+
+            // If browser blocked the popup, switch to manual input step immediately
+            if (!popupRef.current) {
+              setStep("input");
+            }
 
             setPolling(true);
             const maxAttempts = 150;
@@ -252,11 +259,13 @@ export default function OAuthModal({
             setPolling(false);
             throw new Error("Authorization timeout");
           } catch (codexErr) {
+            console.warn(
+              "Codex callback server failed, falling back to standard manual flow",
+              codexErr
+            );
             setPolling(false);
-            setStep("input");
-            setError(codexErr.message + " — You can paste the callback URL manually below.");
+            forceManual = true;
           }
-          return;
         }
         // Remote: fall through to standard auth code flow below
       }
@@ -304,10 +313,17 @@ export default function OAuthModal({
         throw new Error(errMsg);
       }
 
+      if (!data.authUrl) {
+        throw new Error(
+          data.error ||
+            "Browser OAuth is unavailable for this provider in the current environment. Use the supported auth method instead."
+        );
+      }
+
       setAuthData({ ...data, redirectUri });
 
-      // For non-true-localhost (LAN IPs, remote): use manual input mode (user pastes callback URL)
-      if (!isTrueLocalhost) {
+      // For non-true-localhost (LAN IPs, remote) or manual fallback: use manual input mode (user pastes callback URL)
+      if (!isTrueLocalhost || forceManual) {
         setStep("input");
         window.open(data.authUrl, "oauth_auth");
       } else {
@@ -434,7 +450,7 @@ export default function OAuthModal({
   }, [authData, exchangeTokens]);
 
   // Fix #344: Detect when OAuth popup is closed without completing authorization
-  // Some providers (like iFlow) redirect to their own chat UI instead of sending a callback,
+  // Some providers (like Qoder) redirect to their own chat UI instead of sending a callback,
   // leaving the modal stuck at "Waiting for Authorization" forever.
   useEffect(() => {
     if (step !== "waiting" || isDeviceCode || !popupRef.current) return;
@@ -475,24 +491,39 @@ export default function OAuthModal({
       clearInterval(popupClosedInterval);
       clearTimeout(safetyTimeout);
     };
-     
   }, [step, isDeviceCode]);
 
   // Handle manual URL input
   const handleManualSubmit = async () => {
     try {
       setError(null);
-      const url = new URL(callbackUrl);
-      const code = url.searchParams.get("code");
-      const state = url.searchParams.get("state");
-      const errorParam = url.searchParams.get("error");
+      const input = callbackUrl.trim();
+      let code = null;
+      let state = authData?.state || null;
+      let errorParam = null;
+      let errorDescription = null;
+
+      try {
+        const url = new URL(input);
+        code = url.searchParams.get("code");
+        state = url.searchParams.get("state") || url.hash.replace(/^#/, "") || state;
+        errorParam = url.searchParams.get("error");
+        errorDescription = url.searchParams.get("error_description");
+      } catch {
+        // Claude Code remote auth may provide a raw "Authentication Code" like code#state.
+        const [rawCode, rawState] = input.split("#", 2);
+        code = rawCode || null;
+        state = rawState || state;
+      }
 
       if (errorParam) {
-        throw new Error(url.searchParams.get("error_description") || errorParam);
+        throw new Error(errorDescription || errorParam);
       }
 
       if (!code) {
-        throw new Error("No authorization code found in URL");
+        throw new Error(
+          "No authorization code found. Paste the callback URL or the Authentication Code."
+        );
       }
 
       await exchangeTokens(code, state);
@@ -520,7 +551,7 @@ export default function OAuthModal({
               Complete the authorization in the popup window.
             </p>
             <p className="text-xs text-text-muted mb-4 opacity-70">
-              If the popup closes without redirecting back (e.g. iFlow), this dialog will
+              If the popup closes without redirecting back (e.g. Qoder), this dialog will
               automatically switch to manual URL input mode.
             </p>
             <Button variant="ghost" onClick={() => setStep("input")}>
@@ -626,14 +657,19 @@ export default function OAuthModal({
               </div>
 
               <div>
-                <p className="text-sm font-medium mb-2">Step 2: Paste the callback URL here</p>
+                <p className="text-sm font-medium mb-2">
+                  Step 2: Paste the callback URL or auth code here
+                </p>
                 <p className="text-xs text-text-muted mb-2">
-                  After authorization, copy the full URL from your browser.
+                  After authorization, paste the full callback URL. For Claude Code, you can also
+                  paste the Authentication Code directly, for example <code>code#state</code>.
                 </p>
                 <Input
                   value={callbackUrl}
                   onChange={(e) => setCallbackUrl(e.target.value)}
-                  placeholder={placeholderUrl}
+                  placeholder={
+                    provider === "claude" ? "code#state or /callback?code=..." : placeholderUrl
+                  }
                   className="font-mono text-xs"
                 />
               </div>

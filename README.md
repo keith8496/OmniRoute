@@ -2,7 +2,7 @@
 
 ### Never stop coding. Smart routing to **FREE & low-cost AI models** with automatic fallback.
 
-_Your universal API proxy — one endpoint, 44+ providers, zero downtime. Now with **MCP & A2A** agent orchestration._
+_Your universal API proxy — one endpoint, 60+ providers, zero downtime. Now with **MCP Server (25 tools)**, **A2A Protocol**, **Memory/Skills Systems** & **Electron Desktop App**._
 
 **Chat Completions • Embeddings • Image Generation • Video • Music • Audio • Reranking • **Web Search** • MCP Server • A2A Protocol • 100% TypeScript**
 
@@ -26,15 +26,44 @@ _Your universal API proxy — one endpoint, 44+ providers, zero downtime. Now wi
 
 ---
 
-## 🆕 What's New in v3.0.0
+## Breaking Change: Unified Logging Upgrade
+
+> [!WARNING]
+> **This release changes both the on-disk request log layout and the logging environment variables.**
+>
+> If you are upgrading an existing instance:
+>
+> - Request logs now live in `DATA_DIR/call_logs/YYYY-MM-DD/` as **one JSON artifact per request**.
+> - The old `DATA_DIR/logs/` session folders and `DATA_DIR/log.txt` summary file are removed.
+> - On the first startup after upgrading, OmniRoute creates a safety backup at `DATA_DIR/log_archives/*.zip` before removing the deprecated request log layout.
+> - Legacy logging env vars such as `LOG_TO_FILE`, `LOG_FILE_PATH`, `LOG_MAX_FILE_SIZE`, `LOG_RETENTION_DAYS`, `LOG_LEVEL`, `LOG_FORMAT`, `ENABLE_REQUEST_LOGS`, `CALL_LOGS_MAX`, `CALL_LOG_PAYLOAD_MODE`, and `PROXY_LOG_MAX_ENTRIES` are no longer supported.
+> - Use the new env model instead:
+>   - `APP_LOG_TO_FILE`
+>   - `APP_LOG_FILE_PATH`
+>   - `APP_LOG_MAX_FILE_SIZE`
+>   - `APP_LOG_RETENTION_DAYS`
+>   - `APP_LOG_MAX_FILES`
+>   - `APP_LOG_LEVEL`
+>   - `APP_LOG_FORMAT`
+>   - `CALL_LOG_RETENTION_DAYS`
+>   - `CALL_LOG_MAX_ENTRIES`
+>
+> For release details and upgrade notes, see the [CHANGELOG](CHANGELOG.md).
+
+---
+
+## 🆕 What's New
 
 > **Upgrading from v2.9.5?** — See the [full CHANGELOG](CHANGELOG.md#300--2026-03-22-release-candidate--not-yet-merged-to-main) for all changes.
 
 | Area                         | Change                                                                                                                                                                    |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 🔒 **CodeQL Security**       | Fixed 10+ CodeQL alerts: polynomial-redos, insecure-randomness, shell-injection remediation                                                                               |
+| ✅ **Route Validation**      | All 176 API routes now validated with Zod schemas + `validateBody()` — CI `check:route-validation:t06` passes                                                             |
+| 🐛 **omniModel Tag Leak**    | Internal `<omniModel>` tags no longer leak to clients in SSE streaming responses (#585)                                                                                   |
 | 🔑 **Registered Keys API**   | Auto-provision API keys via `POST /api/v1/registered-keys` with per-provider/account quota enforcement, idempotency, SHA-256 storage, and optional GitHub issue reporting |
 | 🎨 **Provider Icons**        | 130+ provider logos via `@lobehub/icons` (SVG) with PNG → generic fallback chain                                                                                          |
-| 🔄 **Model Auto-Sync**       | 24h scheduler refreshes model lists for 16 providers on startup — configurable via `MODEL_SYNC_INTERVAL_HOURS`                                                            |
+| 🔄 **Model Auto-Sync**       | 24h scheduler and manual UI toggle to sync model lists for built-in and custom OpenAI-compatible providers                                                                |
 | 🌐 **OpenCode Zen/Go**       | Two new providers from @kang-heewon via PR #530: free tier + subscription tier via `OpencodeExecutor`                                                                     |
 | 🐛 **Gemini CLI OAuth**      | Actionable error when `GEMINI_OAUTH_CLIENT_SECRET` is missing in Docker (was cryptic Google error)                                                                        |
 | 🐛 **OpenCode config**       | `saveOpenCodeConfig()` now correctly writes TOML to `XDG_CONFIG_HOME`                                                                                                     |
@@ -196,7 +225,7 @@ When opening an issue, please run the system-info command and attach the generat
 npm run system-info
 ```
 
-This generates a `system-info.txt` with your Node.js version, OmniRoute version, OS details, installed CLI tools (iflow, gemini, claude, codex, antigravity, droid, etc.), Docker/PM2 status, and system packages — everything we need to reproduce your issue quickly. Attach the file directly to your GitHub issue.
+This generates a `system-info.txt` with your Node.js version, OmniRoute version, OS details, installed CLI tools (qoder, gemini, claude, codex, antigravity, droid, etc.), Docker/PM2 status, and system packages — everything we need to reproduce your issue quickly. Attach the file directly to your GitHub issue.
 
 ---
 
@@ -222,7 +251,7 @@ This generates a `system-info.txt` with your Node.js version, OmniRoute version,
        │   ↓ budget limit
        ├─→ [Tier 3: CHEAP] GLM ($0.6/1M), MiniMax ($0.2/1M)
        │   ↓ budget limit
-       └─→ [Tier 4: FREE] iFlow, Qwen, Kiro (unlimited)
+       └─→ [Tier 4: FREE] Qoder, Qwen, Kiro (unlimited)
 
 Result: Never stop coding, minimal cost
 ```
@@ -241,9 +270,9 @@ Developers pay $20–200/month for Claude Pro, Codex Pro, or GitHub Copilot. Eve
 **How OmniRoute solves it:**
 
 - **Smart 4-Tier Fallback** — If subscription quota runs out, automatically redirects to API Key → Cheap → Free with zero manual intervention
-- **Real-Time Quota Tracking** — Shows token consumption in real-time with reset countdown (5h, daily, weekly)
+- **Provider Limits Tracking** — Cached quota snapshots refresh on a server-side schedule (default `PROVIDER_LIMITS_SYNC_INTERVAL_MINUTES=70`) with manual refresh available in the UI
 - **Multi-Account Support** — Multiple accounts per provider with auto round-robin — when one runs out, switches to the next
-- **Custom Combos** — Customizable fallback chains with 6 balancing strategies (fill-first, round-robin, P2C, random, least-used, cost-optimized)
+- **Custom Combos** — Customizable fallback chains with 9 balancing strategies (priority, weighted, fill-first, round-robin, P2C, random, least-used, cost-optimized, strict-random)
 - **Codex Business Quotas** — Business/Team workspace quota monitoring directly in the dashboard
 
 </details>
@@ -255,7 +284,7 @@ OpenAI uses one format, Claude (Anthropic) uses another, Gemini yet another. If 
 
 **How OmniRoute solves it:**
 
-- **Unified Endpoint** — A single `http://localhost:20128/v1` serves as proxy for all 44+ providers
+- **Unified Endpoint** — A single `http://localhost:20128/v1` serves as proxy for all 60+ providers
 - **Format Translation** — Automatic and transparent: OpenAI ↔ Claude ↔ Gemini ↔ Responses API
 - **Response Sanitization** — Strips non-standard fields (`x_groq`, `usage_breakdown`, `service_tier`) that break OpenAI SDK v1.83+
 - **Role Normalization** — Converts `developer` → `system` for non-OpenAI providers; `system` → `user` for GLM/ERNIE
@@ -289,7 +318,7 @@ Not everyone can pay $20–200/month for AI subscriptions. Students, devs from e
 
 **How OmniRoute solves it:**
 
-- **Free Tier Providers Built-in** — Native support for 100% free providers: iFlow (5 unlimited models via OAuth: kimi-k2-thinking, qwen3-coder-plus, deepseek-r1, minimax-m2, kimi-k2), Qwen (4 unlimited models: qwen3-coder-plus, qwen3-coder-flash, qwen3-coder-next, vision-model), Kiro (Claude + AWS Builder ID for free), Gemini CLI (180K tokens/month free)
+- **Free Tier Providers Built-in** — Native support for 100% free providers: Qoder (5 unlimited models via OAuth: kimi-k2-thinking, qwen3-coder-plus, deepseek-r1, minimax-m2, kimi-k2), Qwen (4 unlimited models: qwen3-coder-plus, qwen3-coder-flash, qwen3-coder-next, vision-model), Kiro (Claude + AWS Builder ID for free), Gemini CLI (180K tokens/month free)
 - **Ollama Cloud** — Cloud-hosted Ollama models at `api.ollama.com` with free "Light usage" tier; use `ollamacloud/<model>` prefix
 - **Free-Only Combos** — Chain `gc/gemini-3-flash → if/kimi-k2-thinking → qw/qwen3-coder-plus` = $0/month with zero downtime
 - **NVIDIA NIM Free Access** — ~40 RPM dev-forever free access to 70+ models at build.nvidia.com (transitioning from credits to pure rate limits)
@@ -341,7 +370,7 @@ Developers use Cursor, Claude Code, Codex CLI, OpenClaw, Gemini CLI, Kilo Code..
 - **CLI Tools Dashboard** — Dedicated page with one-click setup for Claude Code, Codex CLI, OpenClaw, Kilo Code, Antigravity, Cline
 - **GitHub Copilot Config Generator** — Generates `chatLanguageModels.json` for VS Code with bulk model selection
 - **Onboarding Wizard** — Guided 4-step setup for first-time users
-- **One endpoint, all models** — Configure `http://localhost:20128/v1` once, access 44+ providers
+- **One endpoint, all models** — Configure `http://localhost:20128/v1` once, access 60+ providers
 
 </details>
 
@@ -353,7 +382,7 @@ Claude Code, Codex, Gemini CLI, Copilot — all use OAuth 2.0 with expiring toke
 **How OmniRoute solves it:**
 
 - **Auto Token Refresh** — OAuth tokens refresh in background before expiration
-- **OAuth 2.0 (PKCE) Built-in** — Automatic flow for Claude Code, Codex, Gemini CLI, Copilot, Kiro, Qwen, iFlow
+- **OAuth 2.0 (PKCE) Built-in** — Automatic flow for Claude Code, Codex, Gemini CLI, Copilot, Kiro, Qwen, Qoder
 - **Multi-Account OAuth** — Multiple accounts per provider via JWT/ID token extraction
 - **OAuth LAN/Remote Fix** — Private IP detection for `redirect_uri` + manual URL mode for remote servers
 - **OAuth Behind Nginx** — Uses `window.location.origin` for reverse proxy compatibility
@@ -388,7 +417,7 @@ When a call fails, the dev doesn't know if it was a rate limit, expired token, w
 - **SQLite Proxy Logs** — Persistent logs that survive server restarts
 - **Translator Playground** — 4 debugging modes: Playground (format translation), Chat Tester (round-trip), Test Bench (batch), Live Monitor (real-time)
 - **Request Telemetry** — p50/p95/p99 latency + X-Request-Id tracing
-- **File-Based Logging with Rotation** — Console interceptor captures everything to JSON log with size-based rotation
+- **File-Based Logging with Rotation** — App logs rotate by size, retention days, and archive count; call log artifacts rotate by retention days and file count
 - **System Info Report** — `npm run system-info` generates `system-info.txt` with your full environment (Node version, OmniRoute version, OS, CLI tools, Docker/PM2 status). Attach it when reporting issues for instant triage.
 
 </details>
@@ -406,7 +435,7 @@ Installing, configuring, and maintaining an AI proxy across different environmen
 - **Electron Desktop App** — Native app for Windows/macOS/Linux with system tray, auto-start, offline mode
 - **Split-Port Mode** — API and Dashboard on separate ports for advanced scenarios (reverse proxy, container networking)
 - **Cloud Sync** — Config synchronization across devices via Cloudflare Workers
-- **DB Backups** — Automatic backup, restore, export and import of all settings
+- **DB Backups** — Automatic backup, restore, export and import of all settings, with `DISABLE_SQLITE_AUTO_BACKUP` for externally managed backups
 
 </details>
 
@@ -483,7 +512,7 @@ Developers who want all responses in a specific language, with a specific tone, 
 
 - **System Prompt Injection** — Global prompt applied to all requests
 - **Thinking Budget Validation** — Reasoning token allocation control per request (passthrough, auto, custom, adaptive)
-- **6 Routing Strategies** — Global strategies that determine how requests are distributed
+- **9 Routing Strategies** — Global strategies that determine how requests are distributed
 - **Wildcard Router** — `provider/*` patterns route dynamically to any provider
 - **Combo Enable/Disable Toggle** — Toggle combos directly from the dashboard
 - **Provider Toggle** — Enable/disable all connections for a provider with one click
@@ -550,7 +579,7 @@ Different clients should have least-privilege access to tool categories.
 
 **How OmniRoute solves it:**
 
-- 9 granular MCP scopes for controlled tool access
+- 10 granular MCP scopes for controlled tool access
 - Scope enforcement and visibility in MCP management UI
 - Safe default posture for operational tooling
 
@@ -730,7 +759,7 @@ Outcome: deep fallback depth for deadline-critical workloads
 | Step | Action                                             | Providers Unlocked                                                 |
 | ---- | -------------------------------------------------- | ------------------------------------------------------------------ |
 | 1    | Connect **Kiro** (AWS Builder ID OAuth)            | Claude Sonnet 4.5, Haiku 4.5 — **unlimited**                       |
-| 2    | Connect **iFlow** (Google OAuth)                   | kimi-k2-thinking, qwen3-coder-plus, deepseek-r1... — **unlimited** |
+| 2    | Connect **Qoder** (Google OAuth)                   | kimi-k2-thinking, qwen3-coder-plus, deepseek-r1... — **unlimited** |
 | 3    | Connect **Qwen** (Device Code)                     | qwen3-coder-plus, qwen3-coder-flash... — **unlimited**             |
 | 4    | Connect **Gemini CLI** (Google OAuth)              | gemini-3-flash, gemini-2.5-pro — **180K/mo free**                  |
 | 5    | `/dashboard/combos` → **Free Stack ($0)** template | Round-robin all free providers automatically                       |
@@ -773,6 +802,36 @@ PORT=20128 DASHBOARD_PORT=20129 omniroute
 # API:       http://localhost:20128/v1
 # Dashboard: http://localhost:20129
 ```
+
+### Long-Running Streaming Timeouts
+
+For most deployments, you only need:
+
+| Variable                 | Default                       | Purpose                                                                                                                     |
+| ------------------------ | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `REQUEST_TIMEOUT_MS`     | `600000`                      | Shared baseline for upstream fetch, hidden Undici timeouts, TLS fingerprint requests, and API bridge request/proxy timeouts |
+| `STREAM_IDLE_TIMEOUT_MS` | inherits `REQUEST_TIMEOUT_MS` | Maximum gap between streaming chunks before OmniRoute aborts the SSE stream                                                 |
+
+Backward compatibility is preserved: existing `FETCH_TIMEOUT_MS`, `API_BRIDGE_PROXY_TIMEOUT_MS`, and other per-layer timeout vars still work and override the shared baseline.
+
+Advanced overrides are available if you need finer control:
+
+| Variable                                 | Default                                    | Purpose                                                              |
+| ---------------------------------------- | ------------------------------------------ | -------------------------------------------------------------------- |
+| `FETCH_TIMEOUT_MS`                       | inherits `REQUEST_TIMEOUT_MS`              | Total upstream request timeout used by the main fetch abort signal   |
+| `FETCH_HEADERS_TIMEOUT_MS`               | inherits `FETCH_TIMEOUT_MS`                | Undici time limit for receiving upstream response headers            |
+| `FETCH_BODY_TIMEOUT_MS`                  | inherits `FETCH_TIMEOUT_MS`                | Undici time limit between upstream body chunks (`0` disables it)     |
+| `FETCH_CONNECT_TIMEOUT_MS`               | `30000`                                    | Undici TCP connect timeout                                           |
+| `FETCH_KEEPALIVE_TIMEOUT_MS`             | `4000`                                     | Undici idle keep-alive socket timeout                                |
+| `TLS_CLIENT_TIMEOUT_MS`                  | inherits `FETCH_TIMEOUT_MS`                | Timeout for TLS fingerprint requests made through `wreq-js`          |
+| `API_BRIDGE_PROXY_TIMEOUT_MS`            | inherits `REQUEST_TIMEOUT_MS` or `30000`   | Timeout for `/v1` proxy forwarding from API port to dashboard port   |
+| `API_BRIDGE_SERVER_REQUEST_TIMEOUT_MS`   | `max(API_BRIDGE_PROXY_TIMEOUT_MS, 300000)` | Incoming request timeout on the API bridge server                    |
+| `API_BRIDGE_SERVER_HEADERS_TIMEOUT_MS`   | `60000`                                    | Incoming header timeout on the API bridge server                     |
+| `API_BRIDGE_SERVER_KEEPALIVE_TIMEOUT_MS` | `5000`                                     | Keep-alive timeout on the API bridge server                          |
+| `API_BRIDGE_SERVER_SOCKET_TIMEOUT_MS`    | `0`                                        | Socket inactivity timeout on the API bridge server (`0` disables it) |
+
+If you run OmniRoute behind Nginx, Caddy, Cloudflare, or another reverse proxy, make sure the proxy
+timeouts are also higher than your OmniRoute stream/fetch timeouts.
 
 ### 2) Connect providers and create your API key
 
@@ -831,6 +890,113 @@ npm install
 PORT=20128 DASHBOARD_PORT=20129 NEXT_PUBLIC_BASE_URL=http://localhost:20129 npm run dev
 ```
 
+<details>
+<summary><b>Void Linux (`xbps-src` template)</b></summary>
+
+For Void Linux users, you can build a native package using `xbps-src`. Save this block as `srcpkgs/omniroute/template`:
+
+```bash
+# Template file for 'omniroute'
+pkgname=omniroute
+version=3.4.1
+revision=1
+hostmakedepends="nodejs python3 make"
+depends="openssl"
+short_desc="Universal AI gateway with smart routing for multiple LLM providers"
+maintainer="zenobit <zenobit@disroot.org>"
+license="MIT"
+homepage="https://github.com/diegosouzapw/OmniRoute"
+distfiles="https://github.com/diegosouzapw/OmniRoute/archive/refs/tags/v${version}.tar.gz"
+checksum=009400afee90a9f32599d8fe734145cfd84098140b7287990183dde45ae2245b
+system_accounts="_omniroute"
+omniroute_homedir="/var/lib/omniroute"
+export NODE_ENV=production
+export npm_config_engine_strict=false
+export npm_config_loglevel=error
+export npm_config_fund=false
+export npm_config_audit=false
+
+do_build() {
+	# Determine target CPU arch for node-gyp
+	local _gyp_arch
+	case "$XBPS_TARGET_MACHINE" in
+		aarch64*) _gyp_arch=arm64 ;;
+		armv7*|armv6*) _gyp_arch=arm ;;
+		i686*) _gyp_arch=ia32 ;;
+		*) _gyp_arch=x64 ;;
+	esac
+
+	# 1) Install all deps – skip scripts (no network in do_build, native modules
+	#    compiled separately below; better-sqlite3 is serverExternalPackage so
+	#    Next.js does not execute it during next build)
+	NODE_ENV=development npm ci --ignore-scripts
+
+	# 2) Build the Next.js standalone bundle
+	npm run build
+
+	# 3) Copy static assets into standalone
+	cp -r .next/static .next/standalone/.next/static
+	[ -d public ] && cp -r public .next/standalone/public || true
+
+	# 4) Compile better-sqlite3 native binding for the target architecture.
+	#    Use node-gyp directly so CC/CXX from xbps-src cross-toolchain are used
+	#    without npm altering them.
+	local _node_gyp=/usr/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js
+	(cd node_modules/better-sqlite3 && node "$_node_gyp" rebuild --arch="$_gyp_arch")
+
+	# 5) Place the compiled binding into the standalone bundle
+	local _bs3_release=.next/standalone/node_modules/better-sqlite3/build/Release
+	mkdir -p "$_bs3_release"
+	cp node_modules/better-sqlite3/build/Release/better_sqlite3.node "$_bs3_release/"
+
+	# 6) Remove arch-specific sharp bundles – upstream sets images.unoptimized=true
+	#    so sharp is not used at runtime; x64 .so files would break aarch64 strip
+	rm -rf .next/standalone/node_modules/@img
+
+	# 7) Copy pino runtime deps omitted by Next.js static analysis:
+	#    pino-abstract-transport – required by pino's worker thread
+	#    split2 – dep of pino-abstract-transport
+	#    process-warning – dep of pino itself
+	for _mod in pino-abstract-transport split2 process-warning; do
+		cp -r "node_modules/$_mod" .next/standalone/node_modules/
+	done
+}
+
+do_check() {
+	npm run test:unit
+}
+
+do_install() {
+	vmkdir usr/lib/omniroute/.next
+
+	vcopy .next/standalone/. usr/lib/omniroute/.next/standalone
+
+	# Prevent removal of empty Next.js app router dirs by the post-install hook
+	for _d in \
+		.next/standalone/.next/server/app/dashboard \
+		.next/standalone/.next/server/app/dashboard/settings \
+		.next/standalone/.next/server/app/dashboard/providers; do
+		touch "${DESTDIR}/usr/lib/omniroute/${_d}/.keep"
+	done
+
+	cat > "${WRKDIR}/omniroute" <<'EOF'
+#!/bin/sh
+export PORT="${PORT:-20128}"
+export DATA_DIR="${DATA_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/omniroute}"
+export LOG_TO_FILE="${LOG_TO_FILE:-false}"
+mkdir -p "${DATA_DIR}"
+exec node /usr/lib/omniroute/.next/standalone/server.js "$@"
+EOF
+	vbin "${WRKDIR}/omniroute"
+}
+
+post_install() {
+	vlicense LICENSE
+}
+```
+
+</details>
+
 ---
 
 ## 🐳 Docker
@@ -843,6 +1009,7 @@ OmniRoute is available as a public Docker image on [Docker Hub](https://hub.dock
 docker run -d \
   --name omniroute \
   --restart unless-stopped \
+  --stop-timeout 40 \
   -p 20128:20128 \
   -v omniroute-data:/app/data \
   diegosouzapw/omniroute:latest
@@ -857,6 +1024,7 @@ cp .env.example .env
 docker run -d \
   --name omniroute \
   --restart unless-stopped \
+  --stop-timeout 40 \
   --env-file .env \
   -p 20128:20128 \
   -v omniroute-data:/app/data \
@@ -871,6 +1039,48 @@ docker compose --profile base up -d
 
 # CLI profile (Claude Code, Codex, OpenClaw built-in)
 docker compose --profile cli up -d
+```
+
+Dashboard support for Docker deployments now includes a one-click **Cloudflare Quick Tunnel** on `Dashboard → Endpoints`. The first enable downloads `cloudflared` only when needed, starts a temporary tunnel to your current `/v1` endpoint, and shows the generated `https://*.trycloudflare.com/v1` URL directly below your normal public URL.
+
+Notes:
+
+- Quick Tunnel URLs are temporary and change after every restart.
+- Quick Tunnels are not auto-restored after an OmniRoute or container restart. Re-enable them from the dashboard when needed.
+- Managed install currently supports Linux, macOS, and Windows on `x64` / `arm64`.
+- Managed Quick Tunnels default to HTTP/2 transport to avoid noisy QUIC UDP buffer warnings in constrained container environments. Set `CLOUDFLARED_PROTOCOL=quic` or `auto` if you want a different transport.
+- Docker images bundle system CA roots and pass them to managed `cloudflared`, which avoids TLS trust failures when the tunnel bootstraps inside the container.
+- SQLite runs in WAL mode. `docker stop` should be allowed to finish so OmniRoute can checkpoint the latest changes back into `storage.sqlite`.
+- The bundled Compose files already set a 40s stop grace period. If you run the image directly, keep `--stop-timeout 40` (or similar) so manual stops do not cut off shutdown cleanup.
+- Set `CLOUDFLARED_BIN=/absolute/path/to/cloudflared` if you want OmniRoute to use an existing binary instead of downloading one.
+
+**Using Docker Compose with Caddy (HTTPS Auto-TLS):**
+
+OmniRoute can be securely exposed using Caddy's automatic SSL provisioning. Ensure your domain's DNS A record points to your server's IP.
+
+```yaml
+services:
+  omniroute:
+    image: diegosouzapw/omniroute:latest
+    container_name: omniroute
+    restart: unless-stopped
+    volumes:
+      - omniroute-data:/app/data
+    environment:
+      - PORT=20128
+      - NEXT_PUBLIC_BASE_URL=https://your-domain.com
+
+  caddy:
+    image: caddy:latest
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    command: caddy reverse-proxy --from https://your-domain.com --to http://omniroute:20128
+
+volumes:
+  omniroute-data:
 ```
 
 | Image                    | Tag      | Size   | Description           |
@@ -939,7 +1149,7 @@ When minimized, OmniRoute lives in your system tray with quick actions:
 |                     | MiniMax M2.1                | $0.2/1M                   | 5-hour rolling   | Cheapest option                   |
 |                     | Kimi K2.5 (Moonshot API) 🆕 | Pay-per-use               | None             | Direct Moonshot API access        |
 |                     | Kimi K2                     | $9/mo flat                | 10M tokens/mo    | Predictable cost                  |
-| **🆓 FREE**         | iFlow                       | **$0**                    | Unlimited        | 5 models unlimited                |
+| **🆓 FREE**         | Qoder                       | **$0**                    | Unlimited        | 5 models unlimited                |
 |                     | Qwen                        | **$0**                    | Unlimited        | 4 models unlimited                |
 |                     | Kiro                        | **$0**                    | Unlimited        | Claude Sonnet/Haiku (AWS Builder) |
 |                     | LongCat Flash-Lite 🆕       | **$0** (50M tok/day 🔥)   | 1 RPS            | Largest free quota on Earth       |
@@ -954,7 +1164,7 @@ When minimized, OmniRoute lives in your system tray with quick actions:
 ```
 # 🆓 Ultimate Free Stack 2026 — 11 Providers, $0 Forever
 Kiro (kr/)             → Claude Sonnet/Haiku UNLIMITED
-iFlow (if/)            → kimi-k2-thinking, qwen3-coder-plus, deepseek-r1 UNLIMITED
+Qoder (if/)            → kimi-k2-thinking, qwen3-coder-plus, deepseek-r1 UNLIMITED
 LongCat Lite (lc/)     → LongCat-Flash-Lite — 50M tokens/day 🔥
 Pollinations (pol/)    → GPT-5, Claude, DeepSeek, Llama 4 — no key needed
 Qwen (qw/)             → qwen3-coder-plus, qwen3-coder-flash, qwen3-coder-next UNLIMITED
@@ -984,7 +1194,7 @@ Cerebras (cerebras/)   → Llama/Qwen world-fastest — 1M tok/day
 | `claude-haiku-4.5`  | `kr/`  | **Unlimited** | No reported daily cap |
 | `claude-opus-4.6`   | `kr/`  | **Unlimited** | Latest Opus via Kiro  |
 
-### 🟢 IFLOW MODELS (Free OAuth — No Credit Card)
+### 🟢 QODER MODELS (Free PAT via qodercli)
 
 | Model              | Prefix | Limit         | Rate Limit      |
 | ------------------ | ------ | ------------- | --------------- |
@@ -993,6 +1203,9 @@ Cerebras (cerebras/)   → Llama/Qwen world-fastest — 1M tok/day
 | `deepseek-r1`      | `if/`  | **Unlimited** | No reported cap |
 | `minimax-m2.1`     | `if/`  | **Unlimited** | No reported cap |
 | `kimi-k2`          | `if/`  | **Unlimited** | No reported cap |
+
+> Recommended connection method: **Personal Access Token + `qodercli`**. Browser OAuth is
+> experimental and disabled by default unless `QODER_OAUTH_*` environment variables are configured.
 
 ### 🟡 QWEN MODELS (Device Code Auth)
 
@@ -1083,7 +1296,7 @@ Available free: `qwen3-235b-a22b-instruct-2507` (Qwen3 235B!), `llama-3.1-70b-in
 >
 > ```
 > Kiro (kr/)             → Claude Sonnet/Haiku UNLIMITED
-> iFlow (if/)            → kimi-k2-thinking, qwen3-coder-plus, deepseek-r1 UNLIMITED
+> Qoder (if/)            → kimi-k2-thinking, qwen3-coder-plus, deepseek-r1 UNLIMITED
 > LongCat Lite (lc/)     → LongCat-Flash-Lite — 50M tokens/day 🔥
 > Pollinations (pol/)    → GPT-5, Claude, DeepSeek, Llama 4 — no key needed
 > Qwen (qw/)             → qwen3-coder models UNLIMITED
@@ -1149,19 +1362,19 @@ OmniRoute v2.0 is built as an operational platform, not just a relay proxy.
 
 ### 🤖 Agent & Protocol Operations (v2.0)
 
-| Feature                               | What It Does                                                                                       |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| 🔧 **MCP Server (16 tools)**          | IDE/agent tools via 3 transports: stdio, SSE (`/api/mcp/sse`), Streamable HTTP (`/api/mcp/stream`) |
-| 🤝 **A2A Server (JSON-RPC + SSE)**    | Agent-to-agent task execution with sync and streaming flows                                        |
-| 🧭 **Consolidated Endpoints Page**    | Tabbed management page with Endpoint Proxy, MCP, A2A, and API Endpoints tabs                       |
-| 🎚️ **Service Enable/Disable Toggles** | ON/OFF switches for MCP and A2A with settings persistence (default: OFF)                           |
-| 🛰️ **MCP Runtime Heartbeat**          | Real process status (pid, uptime, heartbeat age, transport, scope mode)                            |
-| 📋 **MCP Audit Trail**                | Filterable audit logs with success/failure and key attribution                                     |
-| 🔐 **MCP Scope Enforcement**          | 9 granular scope permissions for controlled tool access                                            |
-| 📡 **A2A Task Lifecycle Management**  | List/filter tasks, inspect events/artifacts, cancel running tasks                                  |
-| 📋 **Agent Card Discovery**           | `/.well-known/agent.json` for client auto-discovery                                                |
-| 🧪 **Protocol E2E Test Harness**      | Real MCP SDK + A2A client flows in `test:protocols:e2e`                                            |
-| ⚙️ **Operational Controls**           | Switch combo, apply resilience profiles, reset breakers from one control surface                   |
+| Feature                               | What It Does                                                                                                                           |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| 🔧 **MCP Server (25 tools)**          | IDE/agent tools via 3 transports: stdio, SSE (`/api/mcp/sse`), Streamable HTTP (`/api/mcp/stream`). 18 core + 3 memory + 4 skill tools |
+| 🤝 **A2A Server (JSON-RPC + SSE)**    | Agent-to-agent task execution with sync and streaming flows                                                                            |
+| 🧭 **Consolidated Endpoints Page**    | Tabbed management page with Endpoint Proxy, MCP, A2A, and API Endpoints tabs                                                           |
+| 🎚️ **Service Enable/Disable Toggles** | ON/OFF switches for MCP and A2A with settings persistence (default: OFF)                                                               |
+| 🛰️ **MCP Runtime Heartbeat**          | Real process status (pid, uptime, heartbeat age, transport, scope mode)                                                                |
+| 📋 **MCP Audit Trail**                | Filterable audit logs with success/failure and key attribution                                                                         |
+| 🔐 **MCP Scope Enforcement**          | 10 granular scope permissions for controlled tool access                                                                               |
+| 📡 **A2A Task Lifecycle Management**  | List/filter tasks, inspect events/artifacts, cancel running tasks                                                                      |
+| 📋 **Agent Card Discovery**           | `/.well-known/agent.json` for client auto-discovery                                                                                    |
+| 🧪 **Protocol E2E Test Harness**      | Real MCP SDK + A2A client flows in `test:protocols:e2e`                                                                                |
+| ⚙️ **Operational Controls**           | Switch combo, apply resilience profiles, reset breakers from one control surface                                                       |
 
 ### 🧠 Routing & Intelligence
 
@@ -1172,12 +1385,15 @@ OmniRoute v2.0 is built as an operational platform, not just a relay proxy.
 | 🔄 **Format Translation**          | OpenAI ↔ Claude ↔ Gemini ↔ Responses with schema-safe conversions        |
 | 👥 **Multi-Account Support**       | Multiple accounts per provider with intelligent selection                |
 | 🔄 **Auto Token Refresh**          | OAuth tokens refresh automatically with retry                            |
-| 🎨 **Custom Combos**               | 6 balancing strategies + fallback chain control                          |
+| 🎨 **Custom Combos**               | 9 balancing strategies + fallback chain control                          |
 | 🌐 **Wildcard Router**             | `provider/*` dynamic routing                                             |
 | 🧠 **Thinking Budget Controls**    | Passthrough, auto, custom, and adaptive reasoning limits                 |
 | 🔀 **Model Aliases**               | Built-in + custom model aliasing and migration safety                    |
 | ⚡ **Background Degradation**      | Route low-priority background tasks to cheaper models                    |
 | 🧪 **Task-Aware Smart Routing**    | Auto-select model by content type (coding/vision/analysis/summarization) |
+| 🔄 **A2A Agent Workflows**         | Deterministic FSM orchestrator for stateful multi-step agent executions  |
+| 🔀 **Adaptive Routing**            | Dynamic strategy override based on token volume and prompt complexity    |
+| 🎲 **Provider Diversity**          | Shannon entropy scoring balancing auto-combo traffic distribution        |
 | 💬 **System Prompt Injection**     | Global behavior controls applied consistently                            |
 | 📄 **Responses API Compatibility** | Full `/v1/responses` support for Codex and advanced agentic workflows    |
 
@@ -1208,34 +1424,46 @@ OmniRoute v2.0 is built as an operational platform, not just a relay proxy.
 | 🔏 **CLI Fingerprint Matching**     | Matches native CLI request signatures — **reduces ban risk while preserving proxy IP** |
 | 🌐 **IP Filtering**                 | Allowlist/blocklist control for exposed deployments                                    |
 | 📊 **Editable Rate Limits**         | Configurable global/provider-level limits with persistence                             |
+| 📉 **Graceful Degradation**         | Multi-layer capability fallbacks protecting core gateway operations                    |
+| 📜 **Config Audit Trail**           | Diff-based change tracking preventing operational drift with simple rollbacks          |
+| ⏳ **Provider Health Sync**         | Proactive token expiration monitoring triggering alerts before authorization failures  |
+| 🚪 **Auto-Disable Banned Accounts** | Operational circuit breaker sealing permanently blocked token accounts automatically   |
 | 🔑 **API Key Management + Scoping** | Secure key issuance/rotation and model/provider controls                               |
+| 👁️ **Scoped API Key Reveal** 🆕     | Opt-in recovery of API keys via `ALLOW_API_KEY_REVEAL`                                 |
 | 🛡️ **Protected `/models`**          | Optional auth gating and provider hiding for model catalog                             |
 
 ### 📊 Observability & Analytics
 
-| Feature                         | What It Does                                          |
-| ------------------------------- | ----------------------------------------------------- |
-| 📝 **Request + Proxy Logging**  | Full request/response and proxy logging               |
-| 📋 **Unified Logs Dashboard**   | Request, proxy, audit, and console views in one page  |
-| 🔍 **Request Telemetry**        | p50/p95/p99 latency and request tracing               |
-| 🏥 **Health Dashboard**         | Uptime, breaker states, lockouts, cache stats         |
-| 💰 **Cost Tracking**            | Budget controls and per-model pricing visibility      |
-| 📈 **Analytics Visualizations** | Model/provider usage insights and trend views         |
-| 🧪 **Evaluation Framework**     | Golden set testing with configurable match strategies |
+| Feature                          | What It Does                                          |
+| -------------------------------- | ----------------------------------------------------- |
+| 📝 **Request + Proxy Logging**   | Full request/response and proxy logging               |
+| 📉 **Streamed Detailed Logs** 🆕 | Reconstructs SSE payload streams cleanly into the UI  |
+| 📋 **Unified Logs Dashboard**    | Request, proxy, audit, and console views in one page  |
+| 🔍 **Request Telemetry**         | p50/p95/p99 latency and request tracing               |
+| 🏥 **Health Dashboard**          | Uptime, breaker states, lockouts, cache stats         |
+| 💰 **Cost Tracking**             | Budget controls and per-model pricing visibility      |
+| 📈 **Analytics Visualizations**  | Model/provider usage insights and trend views         |
+| 🧪 **Evaluation Framework**      | Golden set testing with configurable match strategies |
+| 📡 **Live Diagnostics** 🆕       | Semantic cache bypass for accurate combo live testing |
 
 ### ☁️ Deployment & Platform
 
-| Feature                       | What It Does                                             |
-| ----------------------------- | -------------------------------------------------------- |
-| 🌐 **Deploy Anywhere**        | Localhost, VPS, Docker, Cloud environments               |
-| 💾 **Cloud Sync**             | Configuration sync via cloud worker                      |
-| 🔄 **Backup/Restore**         | Export/import and disaster recovery flows                |
-| 🧙 **Onboarding Wizard**      | First-run guided setup                                   |
-| 🔧 **CLI Tools Dashboard**    | One-click setup for popular coding tools                 |
-| 🎮 **Model Playground**       | Test any provider/model/endpoint from the dashboard      |
-| 🔏 **CLI Fingerprint Toggle** | Per-provider fingerprint matching in Settings > Security |
-| 🌐 **i18n (30 languages)**    | Full dashboard + docs language support with RTL coverage |
-| 📂 **Custom Data Directory**  | `DATA_DIR` override for storage location                 |
+| Feature                        | What It Does                                                          |
+| ------------------------------ | --------------------------------------------------------------------- |
+| 🌐 **Deploy Anywhere**         | Localhost, VPS, Docker, Cloud environments                            |
+| 🚇 **Cloudflare Tunnel** 🆕    | One-click Quick Tunnel integration from the dashboard                 |
+| 🔑 **API Key Model Filtering** | Native /v1/models response filtered via assigned Bearer context roles |
+| ⚡ **Smart Cache Bypass**      | Configurable TTL heuristics and forced refetch controls               |
+| 🔄 **Backup/Restore**          | Export/import and disaster recovery flows                             |
+| 🧙 **Onboarding Wizard**       | First-run guided setup                                                |
+| 🔧 **CLI Tools Dashboard**     | One-click setup for popular coding tools                              |
+| 🎮 **Model Playground**        | Test any provider/model/endpoint from the dashboard                   |
+| 🔏 **CLI Fingerprint Toggle**  | Per-provider fingerprint matching in Settings > Security              |
+| 🌐 **i18n (30 languages)**     | Full dashboard + docs language support with RTL coverage              |
+| 🧹 **Clear All Models**        | One-click model list clearing in provider details                     |
+| 👁️ **Sidebar Controls** 🆕     | Hide components and integrations from Appearance Settings             |
+| 📋 **Issue Templates**         | Standardized GitHub templates for bugs and features                   |
+| 📂 **Custom Data Directory**   | `DATA_DIR` override for storage location                              |
 
 ### Feature Deep Dive
 
@@ -1442,7 +1670,7 @@ Dashboard → Providers → Connect GitHub
 Models:
   gh/gpt-5
   gh/claude-4.5-sonnet
-  gh/gemini-3-pro
+  gh/gemini-3.1-pro-preview
 ```
 
 </details>
@@ -1487,6 +1715,8 @@ Models:
 
 **Models:** Access 100+ models from all major providers through a single API key.
 
+**Dashboard behavior:** OpenRouter models are managed from **Available Models**. Manual add, import, and auto-sync all update the same list.
+
 </details>
 
 <details>
@@ -1529,11 +1759,11 @@ Models:
 <details>
 <summary><b>🆓 FREE Providers (Emergency Backup)</b></summary>
 
-### iFlow (5 FREE models via OAuth)
+### Qoder (5 FREE models via OAuth)
 
 ```bash
-Dashboard → Connect iFlow
-→ iFlow OAuth login
+Dashboard → Connect Qoder
+→ Qoder OAuth login
 → Unlimited usage
 
 Models:
@@ -1731,7 +1961,7 @@ opencode
 
 - Check usage stats in Dashboard → Costs
 - Switch primary model to GLM/MiniMax
-- Use free tier (Gemini CLI, iFlow) for non-critical tasks
+- Use free tier (Gemini CLI, Qoder) for non-critical tasks
 
 **Dashboard/API ports are wrong**
 
@@ -1753,7 +1983,10 @@ opencode
 
 **No request logs**
 
-- Set `ENABLE_REQUEST_LOGS=true` in `.env`
+- Request artifacts are written to `DATA_DIR/call_logs/` as one JSON file per request
+- Enable pipeline capture from Dashboard → Logs → Request Logs if you need detailed per-stage payloads
+- Set `APP_LOG_TO_FILE=true` if you also want application console logs in `logs/application/app.log`
+- Adjust `APP_LOG_MAX_FILE_SIZE`, `APP_LOG_RETENTION_DAYS`, `APP_LOG_MAX_FILES`, and `CALL_LOG_MAX_ENTRIES` as needed
 
 **Connection test shows "Invalid" for OpenAI-compatible providers**
 

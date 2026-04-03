@@ -84,7 +84,7 @@ export function convertOpenAIContentToParts(content) {
           const mimeType = mimePart.split(";")[0];
 
           parts.push({
-            inlineData: { mime_type: mimeType, data: data },
+            inlineData: { mimeType, data },
           });
         }
       }
@@ -167,13 +167,19 @@ function convertConstToEnum(obj) {
 }
 
 // Convert enum values to strings (Gemini requires string enum values)
+// For integer types, remove enum entirely as Gemini doesn't support it
 function convertEnumValuesToStrings(obj) {
   if (!obj || typeof obj !== "object") return;
 
   if (obj.enum && Array.isArray(obj.enum)) {
-    obj.enum = obj.enum.map((v) => String(v));
-    if (!obj.type) {
-      obj.type = "string";
+    // Gemini only supports enum for string types, not integer
+    if (obj.type === "integer" || obj.type === "number") {
+      delete obj.enum;
+    } else {
+      obj.enum = obj.enum.map((v) => String(v));
+      if (!obj.type) {
+        obj.type = "string";
+      }
     }
   }
 

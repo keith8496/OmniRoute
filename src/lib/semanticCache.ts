@@ -29,10 +29,67 @@ function toNumber(value: unknown, fallback = 0): number {
   return fallback;
 }
 
+function ensureCacheMetricsTable() {
+  try {
+    const db = getDbInstance();
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS cache_metrics (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )`
+    ).run();
+    db.prepare(
+      `INSERT OR IGNORE INTO cache_metrics (key, value) VALUES ('hits', 0), ('misses', 0), ('tokens_saved', 0)`
+    ).run();
+  } catch {
+    // DB not available
+  }
+}
+
+function incrementMetric(metric: "hits" | "misses" | "tokens_saved", amount = 1) {
+  try {
+    const db = getDbInstance();
+    db.prepare(
+      `UPDATE cache_metrics SET value = value + ?, updated_at = datetime('now') WHERE key = ?`
+    ).run(amount, metric);
+  } catch {
+    // DB not available — fall back to in-memory
+  }
+}
+
+function getMetricValue(metric: string): number {
+  try {
+    const db = getDbInstance();
+    const row = db.prepare(`SELECT value FROM cache_metrics WHERE key = ?`).get(metric);
+    return row ? toNumber(asRecord(row).value, 0) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function getHeaderValue(
+  headers: { get?: (name: string) => string | null } | Record<string, unknown> | null | undefined,
+  name: string
+): string | null {
+  if (!headers) return null;
+
+  if (typeof headers.get === "function") {
+    return headers.get(name);
+  }
+
+  const needle = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() !== needle) continue;
+    return typeof value === "string" ? value : null;
+  }
+
+  return null;
+}
+
 // ─── Singleton ─────────────────
 
 let memoryCache: LRUCache | null = null;
-let stats = { hits: 0, misses: 0, tokensSaved: 0 };
 
 function getMemoryCache() {
   if (!memoryCache) {
@@ -41,6 +98,7 @@ function getMemoryCache() {
       maxBytes: parseInt(process.env.SEMANTIC_CACHE_MAX_BYTES || String(4 * 1024 * 1024), 10),
       defaultTTL: parseInt(process.env.SEMANTIC_CACHE_TTL_MS || "1800000", 10),
     });
+    ensureCacheMetricsTable();
   }
   return memoryCache;
 }
@@ -89,8 +147,8 @@ export function getCachedResponse(signature) {
   // 1. Check memory cache
   const memResult = getMemoryCache().get(signature);
   if (memResult) {
-    stats.hits++;
-    stats.tokensSaved += memResult.tokensSaved || 0;
+    incrementMetric("hits");
+    incrementMetric("tokens_saved", memResult.tokensSaved || 0);
     return memResult.response;
   }
 
@@ -107,7 +165,7 @@ export function getCachedResponse(signature) {
       const record = asRecord(row);
       const responsePayload = typeof record.response === "string" ? record.response : null;
       if (!responsePayload) {
-        stats.misses++;
+        incrementMetric("misses");
         return null;
       }
       const parsed = JSON.parse(responsePayload);
@@ -122,15 +180,15 @@ export function getCachedResponse(signature) {
         signature
       );
 
-      stats.hits++;
-      stats.tokensSaved += tokensSaved;
+      incrementMetric("hits");
+      incrementMetric("tokens_saved", tokensSaved);
       return parsed;
     }
   } catch {
     // DB not available — fail open
   }
 
-  stats.misses++;
+  incrementMetric("misses");
   return null;
 }
 
@@ -261,6 +319,17 @@ export function stopAutoCleanup(): void {
   }
 }
 
+export function cleanOldMetrics(retentionDays = 90): number {
+  try {
+    const db = getDbInstance();
+    const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString();
+    const result = db.prepare("DELETE FROM semantic_cache WHERE created_at < ?").run(cutoff);
+    return result.changes || 0;
+  } catch {
+    return 0;
+  }
+}
+
 /**
  * Clear all cache entries.
  */
@@ -269,17 +338,12 @@ export function clearCache() {
   try {
     const db = getDbInstance();
     db.prepare("DELETE FROM semantic_cache").run();
+    db.prepare("UPDATE cache_metrics SET value = 0").run();
   } catch {
     // DB not available
   }
-  stats = { hits: 0, misses: 0, tokensSaved: 0 };
 }
 
-// ─── Stats ─────────────────
-
-/**
- * Get cache statistics.
- */
 export function getCacheStats() {
   const memStats = getMemoryCache().getStats();
   let dbSize = 0;
@@ -293,14 +357,18 @@ export function getCacheStats() {
     // DB not available
   }
 
-  const total = stats.hits + stats.misses;
+  const hits = getMetricValue("hits");
+  const misses = getMetricValue("misses");
+  const tokensSaved = getMetricValue("tokens_saved");
+  const total = hits + misses;
+
   return {
     memoryEntries: memStats.size,
     dbEntries: dbSize,
-    hits: stats.hits,
-    misses: stats.misses,
-    hitRate: total > 0 ? ((stats.hits / total) * 100).toFixed(1) : "0.0",
-    tokensSaved: stats.tokensSaved,
+    hits,
+    misses,
+    hitRate: total > 0 ? ((hits / total) * 100).toFixed(1) : "0.0",
+    tokensSaved,
   };
 }
 
@@ -309,7 +377,9 @@ export function getCacheStats() {
  * Only non-streaming, deterministic (temperature=0) requests.
  */
 export function isCacheable(body, headers) {
-  if (headers?.get?.("x-omniroute-no-cache") === "true") return false;
+  if ((getHeaderValue(headers, "x-omniroute-no-cache") || "").toLowerCase() === "true") {
+    return false;
+  }
   if (body.stream !== false) return false;
   if ((body.temperature ?? 0) !== 0) return false;
   return true;

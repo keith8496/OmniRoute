@@ -19,7 +19,8 @@ const PROVIDER_MODEL_ALIASES = {
   github: {
     "claude-4.5-opus": "claude-opus-4-5-20251101",
     "claude-opus-4.5": "claude-opus-4-5-20251101",
-    "gemini-3-pro": "gemini-3-pro-preview",
+    "gemini-3-pro": "gemini-3.1-pro-preview",
+    "gemini-3-pro-preview": "gemini-3.1-pro-preview",
     "gemini-3-flash": "gemini-3-flash-preview",
     "raptor-mini": "oswe-vscode-prime",
   },
@@ -242,8 +243,8 @@ export async function getModelInfoCore(modelStr, aliasesOrGetter) {
   // FIX #73: Models like claude-haiku-4-5-20251001 sent without provider prefix
   // would incorrectly route to OpenAI. Use heuristic prefix detection first.
   if (/^claude-/i.test(modelId)) {
-    // Claude models → Antigravity (Anthropic) provider
-    return { provider: "antigravity", model: modelId, extendedContext };
+    // Claude models → Anthropic provider (canonical source for Claude models)
+    return { provider: "anthropic", model: modelId, extendedContext };
   }
   if (/^gemini-/i.test(modelId) || /^gemma-/i.test(modelId)) {
     // Gemini/Gemma models → Gemini provider

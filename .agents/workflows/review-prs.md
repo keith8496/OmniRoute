@@ -6,7 +6,9 @@ description: Analyze open Pull Requests from the project's GitHub repository, ge
 
 ## Overview
 
-This workflow fetches all open PRs from the project's GitHub repository, performs a critical analysis of each one, generates a detailed report, and waits for user approval before proceeding with implementation. **All improvements are committed on top of the PR branch** and the user must verify before merge.
+This workflow fetches all open PRs from the project's GitHub repository, performs a critical analysis of each one, generates a detailed report, and waits for user approval before proceeding with implementation. **All improvements are committed on the current release branch** (`release/vX.Y.Z`).
+
+> **BRANCH RULE**: All work MUST happen on the current `release/vX.Y.Z` branch. Never create separate feature or fix branches. If no release branch exists yet, create one first using `/generate-release` Phase 1 steps 1–5.
 
 ## Steps
 
@@ -16,55 +18,94 @@ This workflow fetches all open PRs from the project's GitHub repository, perform
   // turbo
 - Run: `git -C <project_root> remote get-url origin` to extract the owner/repo
 
-### 2. Fetch Open Pull Requests
+### 2. Ensure Release Branch Exists
 
 // turbo
 
-- Run: `gh pr list --repo <owner>/<repo> --state open --limit 500 --json number,title,author,headRefName,body,createdAt,additions,deletions,files`
-- This fetches **all** open PRs without restriction. Get the diff for each with:
-  `gh pr diff <NUMBER> --repo <owner>/<repo>`
+Before doing any work, ensure you are on the current release branch:
+
+```bash
+# Check current branch
+git branch --show-current
+
+# If on main, determine next version and create the release branch
+VERSION=$(node -p "require('./package.json').version")
+# Bump patch: e.g. 3.3.11 → 3.3.12
+NEXT=$(node -p "const [a,b,c]=('$VERSION').split('.').map(Number); c>=9?a+'.'+(b+1)+'.0':a+'.'+b+'.'+(c+1)")
+git checkout -b release/v$NEXT
+npm version patch --no-git-tag-version
+npm install
+```
+
+If already on a `release/vX.Y.Z` branch, continue working there.
+
+### 3. Fetch Open Pull Requests
+
+// turbo-all
+
+**⚠️ CRITICAL**: The JSON output of `gh pr list` can be truncated by the tool, silently hiding PRs. You MUST use the two-step approach below to guarantee **all** PRs are fetched.
+
+**Step 3a — Get PR numbers only** (small output, never truncated):
+
+- Run: `gh pr list --repo <owner>/<repo> --state open --limit 500 --json number --jq '.[].number'`
+- This outputs one PR number per line. Count them and confirm total.
+
+**Step 3b — Fetch full metadata for each PR** (one call per PR):
+
+- For each PR number from step 3a, run:
+  `gh pr view <NUMBER> --repo <owner>/<repo> --json number,title,author,headRefName,body,createdAt,additions,deletions,files`
+- You may batch these into parallel calls (up to 4 at a time).
+
+**Step 3c — Fetch diffs for each PR** (one call per PR, saved to /tmp):
+
+- For each PR number, run:
+  `gh pr diff <NUMBER> --repo <owner>/<repo> > /tmp/pr<NUMBER>.diff`
+- Then read each diff file with `view_file`.
+
 - For each open PR, collect:
   - PR number, title, author, branch, number of commits, date
   - PR description/body
   - Files changed (diff)
   - Existing review comments (from bots or humans)
 
-### 3. Analyze Each PR — For each open PR, perform the following analysis:
+**Verification**: Confirm the count of PRs analyzed matches the count from step 3a before proceeding.
 
-#### 3a. Feature Assessment
+### 4. Analyze Each PR — For each open PR, perform the following analysis:
+
+#### 4a. Feature Assessment
 
 - **Does it make sense?** Evaluate if the feature fills a real gap or solves a valid problem
 - **Alignment** — Check if it aligns with the project's architecture and roadmap
 - **Complexity** — Assess if the scope is reasonable or if it should be split
 
-#### 3b. Code Quality Review
+#### 4b. Code Quality Review
 
 - Check for code duplication
 - Evaluate error handling patterns (consistent with existing codebase?)
 - Check naming conventions and code style
 - Verify TypeScript types (any `any` usage, missing types?)
 
-#### 3c. Security Review
+#### 4c. Security Review
 
 - Check for missing authentication/authorization on new endpoints
 - Check for injection vulnerabilities (URL params, SQL, XSS)
 - Verify input validation on all user-controlled data
 - Check for hardcoded secrets or credentials
 
-#### 3d. Architecture Review
+#### 4d. Architecture Review
 
 - Does the change follow existing patterns?
 - Are there any breaking changes to public APIs?
 - Is the database schema affected? Migration needed?
 - Impact on performance (N+1 queries, missing indexes?)
 
-#### 3e. Test Coverage
+#### 4e. Test Coverage
 
 - Does the PR include tests?
 - Are edge cases covered?
 - Would existing tests break?
 
-#### 3f. Cross-Layer (Global) Analysis
+#### 4f. Cross-Layer (Global) Analysis
 
 Perform a **global impact assessment** to verify whether the PR changes are complete across all layers of the application:
 
@@ -79,7 +120,7 @@ Perform a **global impact assessment** to verify whether the PR changes are comp
 - **Cross-cutting concerns**: Check shared layers (types, DTOs, validation schemas, routes, middleware) for completeness
 - **Document gaps** — If missing layers are detected, list them as **IMPORTANT** issues in the report with concrete suggestions for what should be added
 
-### 4. Generate Report — Create a markdown report for each PR including:
+### 5. Generate Report — Create a markdown report for each PR including:
 
 - **PR Summary** — What it does, files affected, commit count
 - **Improvements/Benefits** — Numbered list with impact level (HIGH/MEDIUM/LOW)
@@ -88,62 +129,71 @@ Perform a **global impact assessment** to verify whether the PR changes are comp
 - **Verdict** — Ready to merge? With mandatory vs optional fixes
 - **Next Steps** — What will happen if approved
 
-### 5. Present to User
+### 6. Present to User
 
 - Show the report via `notify_user` with `BlockedOnUser: true`
 - Wait for user decision:
-  - **Approved** → Proceed to step 6
+  - **Approved** → Proceed to step 7
   - **Approved with changes** → Implement the fixes and corrections before merging
   - **Rejected** → Close the PR or leave a review comment
 
-### 6. Implementation (if approved)
+### 7. Pre-Merge Fixes & CI Green-Lighting (if approved)
 
-- Checkout the PR branch: `gh pr checkout <NUMBER>`
-- Implement any required fixes identified in the analysis
-- If the Cross-Layer Analysis (3f) identified missing frontend/backend counterparts, implement them
-- **Commit improvements on top of the PR branch** with descriptive commit messages
-- Run the project's test suite to verify nothing breaks
+> **⚠️ Fixes should be pushed back to the PR branch before merging.** We want the PR itself to be green and fully valid before it integrates.
+
+- **Sync latest fixes:** Merge `main` or the current `release` branch into the PR branch so the PR inherits any latest CI or integration test fixes (preventing false-positive failures).
+- **Implement improvements:** Apply the required fixes identified in the analysis directly on the PR branch (e.g., adding missing API routes, fixing SSRF, applying comments from other agents).
+- **Pushing changes to PR branches:**
+
+  ```bash
+  # Checkout the PR locally
+  gh pr checkout <NUMBER>
+
+  # Apply fixes, commit your changes
+  git commit -m "chore: apply review suggestions and missing layers"
+
+  # Attempt to push directly to the PR branch
+  git push
+  ```
+
+- **Fallback (For external forks without maintainer edit access):**
+  If `git push` fails because the PR comes from an external fork without write access, you MUST:
+  1. Create a new branch ending in `-fix` (e.g., `checkout -b fix-pr-<NUMBER>`).
+  2. Push your branch to the main repo (`git push origin fix-pr-<NUMBER>`).
+  3. Create a Pull Request targeting the contributor's repository and branch (use `gh pr create --repo <contributor-repo> --base <contributor-branch> --head diegosouzapw:fix-pr-<NUMBER>`).
+  4. Once they accept our PR into their branch, their original PR to our `main` will automatically update and become green.
+
+- Run the project's test suite locally to verify nothing breaks:
   // turbo
 - Run: `npm test` or equivalent test command
-- Build the project to verify compilation
-  // turbo
-- Run: `npm run build` or equivalent build command
-- Push the updated branch: `git push origin <branch-name>`
 
-### 7. 🛑 WAIT — Notify User & Await PR Verification
+### 8. Merge & Integrate
 
-**This is a mandatory stop point.** Use `notify_user` with `BlockedOnUser: true`:
+- Once the PR is green (you can check with `gh pr status`), proceed to merge the PR into the current release branch (`release/vX.Y.Z`).
 
-- Inform the user that the PR has been **improved and pushed**, and is **awaiting their verification**
-- Include:
-  - PR number and URL
-  - Summary of improvements/fixes applied
-  - Build/test status
-  - List of files changed
-- **DO NOT merge, generate releases, or deploy until the user confirms**
-
-Wait for the user to respond:
-
-- **User confirms** → Proceed to step 8
-- **User requests more changes** → Apply changes, push to the same branch, notify again
-- **User rejects** → Leave a review comment and stop
-
-### 8. Thank the Contributor
+  ```bash
+  gh pr merge <NUMBER> --repo <owner>/<repo>
+  ```
 
 - Post a **thank-you comment** on the PR via the GitHub API
 - The message should:
   - Thank the author by name/username for their contribution
   - Briefly mention what the PR accomplishes and any improvements applied
+  - Note it will be included in the upcoming release
   - Be friendly, professional, and encouraging
-- Example: _"Thanks @author for this great contribution! 🎉 The [feature/fix] is now merged and will be part of the next release. We appreciate your effort!"_
+- Example: _"Thanks @author for this great contribution! 🎉 The [feature/fix] has been integrated into the release/vX.Y.Z branch and will be part of the next release. We appreciate your effort!"_
 
-### 9. Merge & Release (only after user confirms PR)
+### 9. Close the Original PR
 
-After the user confirms the PR:
+- Close the original PR with a comment explaining it was integrated into the release branch:
+  ```bash
+  gh pr close <NUMBER> --repo <owner>/<repo> --comment "Integrated into release/vX.Y.Z. Will be released as part of v3.X.Y. Thank you!"
+  ```
 
-1. **Merge** the PR into main (local merge with `--no-ff` or via `gh pr merge`)
-2. **Push** to main: `git push origin main`
-3. **Clean up** the feature branch: `git branch -d <branch-name>`
-4. **Update CHANGELOG.md** with the new feature/fix
-5. Run the `/generate-release` workflow (at `.agents/workflows/generate-release.md`) to bump version, tag, and publish
-6. Deploy to local VPS: `ssh root@192.168.0.15 "npm install -g omniroute@<VERSION> && pm2 restart omniroute"`
+### 10. Continue or Finalize
+
+After processing all approved PRs:
+
+- If more PRs remain, go back to step 7
+- When all PRs are processed, **update CHANGELOG.md** on the release branch with all new entries
+- Run `/generate-release` workflow Phase 1 steps 7–10 (tests → commit → push → open PR to main → wait for user)

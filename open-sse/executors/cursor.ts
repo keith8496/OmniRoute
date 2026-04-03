@@ -20,7 +20,7 @@ declare const EdgeRuntime: string | undefined;
  * @see cursorProtobuf.js for Protobuf encoding/decoding utilities
  */
 
-import { BaseExecutor } from "./base.ts";
+import { BaseExecutor, mergeUpstreamExtraHeaders } from "./base.ts";
 import { PROVIDERS, HTTP_STATUS } from "../config/constants.ts";
 import {
   generateCursorBody,
@@ -363,10 +363,11 @@ export class CursorExecutor extends BaseExecutor {
     });
   }
 
-  async execute({ model, body, stream, credentials, signal, log }) {
+  async execute({ model, body, stream, credentials, signal, log, upstreamExtraHeaders }) {
     const url = this.buildUrl();
     const headers = this.buildHeaders(credentials);
-    const transformedBody = this.transformRequest(model, body, stream, credentials);
+    mergeUpstreamExtraHeaders(headers, upstreamExtraHeaders);
+    const transformedBody = await this.transformRequest(model, body, stream, credentials);
 
     try {
       const response: CursorHttpResponse = http2

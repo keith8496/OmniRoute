@@ -49,7 +49,7 @@ const budget = [
   { file: "open-sse/executors/base.ts", maxAny: 0 },
   { file: "open-sse/executors/kiro.ts", maxAny: 0 },
   { file: "open-sse/executors/cursor.ts", maxAny: 0 },
-  { file: "open-sse/executors/iflow.ts", maxAny: 0 },
+  { file: "open-sse/executors/qoder.ts", maxAny: 0 },
   { file: "open-sse/utils/comfyuiClient.ts", maxAny: 0 },
   { file: "open-sse/utils/tlsClient.ts", maxAny: 0 },
   { file: "open-sse/utils/proxyFetch.ts", maxAny: 0 },
@@ -110,7 +110,10 @@ for (const item of budget) {
   }
 
   const content = fs.readFileSync(absolutePath, "utf8");
-  const matches = content.match(anyRegex);
+  // Remove block and line comments to avoid false positives with the word "any" in comments
+  let cleanContent = content.replace(/\/\*[\s\S]*?\*\//g, "");
+  cleanContent = cleanContent.replace(/\/\/.*$/gm, "");
+  const matches = cleanContent.match(anyRegex);
   const count = matches ? matches.length : 0;
   const status = count <= item.maxAny ? "OK" : "FAIL";
 

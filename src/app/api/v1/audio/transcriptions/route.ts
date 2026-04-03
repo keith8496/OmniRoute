@@ -1,4 +1,7 @@
 import { CORS_ORIGIN } from "@/shared/utils/cors";
+
+// Allow large audio/video file uploads — 5min for processing large files (up to 2GB)
+export const maxDuration = 300;
 import { handleAudioTranscription } from "@omniroute/open-sse/handlers/audioTranscription.ts";
 import {
   getProviderCredentials,
@@ -68,11 +71,11 @@ export async function POST(request) {
         if (n.apiType !== "chat" && n.apiType !== "responses") return false;
         try {
           const hostname = new URL(n.baseUrl).hostname;
+          // Strictly matching 172.16.0.0/12 (Docker/local) and explicitly blocking ::1 per SSRF hardening
           return (
             hostname === "localhost" ||
             hostname === "127.0.0.1" ||
-            hostname === "::1" ||
-            hostname === "[::1]"
+            /^172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname)
           );
         } catch {
           return false;

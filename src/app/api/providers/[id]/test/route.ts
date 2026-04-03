@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { z } from "zod";
+import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import {
   getProviderConnectionById,
   updateProviderConnection,
@@ -57,7 +59,7 @@ const OAUTH_TEST_CONFIG = {
     refreshable: true,
   },
   qwen: {
-    // portal.qwen.ai/v1/models returns 404 — endpoint no longer exists.
+    // DashScope (previously portal.qwen.ai) /v1/models might return 404 or auth issues.
     // Use checkExpiry instead — actual connectivity is validated via real requests.
     checkExpiry: true,
     refreshable: true,
@@ -90,7 +92,13 @@ const OAUTH_TEST_CONFIG = {
 const CLI_RUNTIME_PROVIDER_MAP = {
   cline: "cline",
   kilocode: "kilo",
+  qoder: "qoder",
 };
+
+/** POST body is optional; when present, only known fields are validated. */
+const providerConnectionTestBodySchema = z.object({
+  validationModelId: z.string().max(500).optional(),
+});
 
 function toSafeMessage(value: any, fallback = "Unknown error"): string {
   if (typeof value !== "string") return fallback;
@@ -199,8 +207,12 @@ function classifyFailure({
   );
 }
 
-async function getProviderRuntimeStatus(provider: string) {
-  const toolId = CLI_RUNTIME_PROVIDER_MAP[provider];
+async function getProviderRuntimeStatus(connection: any) {
+  const provider = typeof connection?.provider === "string" ? connection.provider : "";
+  let toolId = CLI_RUNTIME_PROVIDER_MAP[provider];
+  if (provider === "qoder" && connection?.authType !== "apikey") {
+    toolId = null;
+  }
   if (!toolId) return null;
 
   try {
@@ -559,7 +571,7 @@ export async function testSingleConnection(connectionId: string, validationModel
 
   let result;
   const startTime = Date.now();
-  const runtime = await getProviderRuntimeStatus(provider);
+  const runtime = await getProviderRuntimeStatus(connection);
 
   if ((runtime as any)?.diagnosis) {
     result = {
@@ -683,14 +695,17 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   try {
     const { id } = await params;
 
-    // Parse optional body for validationModelId
-    let validationModelId;
+    let rawBody: unknown = {};
     try {
-      const body = await request.json();
-      validationModelId = body?.validationModelId;
+      rawBody = await request.json();
     } catch {
-      // Body is optional
+      // Empty or non-JSON body — treat as {}
     }
+    const validation = validateBody(providerConnectionTestBodySchema, rawBody);
+    if (isValidationFailure(validation)) {
+      return NextResponse.json({ error: validation.error }, { status: 400 });
+    }
+    const { validationModelId } = validation.data;
 
     const data = await testSingleConnection(id, validationModelId);
 

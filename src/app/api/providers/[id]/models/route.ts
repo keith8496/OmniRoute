@@ -1,10 +1,13 @@
 import { NextResponse } from "next/server";
 import { getProviderConnectionById } from "@/models";
 import {
+  isClaudeCodeCompatibleProvider,
   isOpenAICompatibleProvider,
   isAnthropicCompatibleProvider,
 } from "@/shared/constants/providers";
 import { PROVIDER_MODELS } from "@/shared/constants/models";
+import { getModelIsHidden } from "@/lib/localDb";
+import { getStaticQoderModels } from "@omniroute/open-sse/services/qoderCli.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -16,6 +19,16 @@ function getProviderBaseUrl(providerSpecificData: unknown): string | null {
   const data = asRecord(providerSpecificData);
   const baseUrl = data.baseUrl;
   return typeof baseUrl === "string" && baseUrl.trim().length > 0 ? baseUrl : null;
+}
+
+const GLM_MODELS_URLS = {
+  international: "https://api.z.ai/api/coding/paas/v4/models",
+  china: "https://open.bigmodel.cn/api/coding/paas/v4/models",
+} as const;
+
+function getGlmApiRegion(providerSpecificData: unknown): keyof typeof GLM_MODELS_URLS {
+  const data = asRecord(providerSpecificData);
+  return data.apiRegion === "china" ? "china" : "international";
 }
 
 type ProviderModelsConfigEntry = {
@@ -55,6 +68,22 @@ const STATIC_MODEL_PROVIDERS: Record<string, () => Array<{ id: string; name: str
     { id: "nanobanana-flash", name: "NanoBanana Flash (Gemini 2.5 Flash)" },
     { id: "nanobanana-pro", name: "NanoBanana Pro (Gemini 3 Pro)" },
   ],
+  antigravity: () => [
+    { id: "claude-opus-4-6-thinking", name: "Claude Opus 4.6 Thinking" },
+    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+    { id: "gemini-3-flash", name: "Gemini 3 Flash" },
+    { id: "gemini-3.1-flash-image", name: "Gemini 3.1 Flash Image" },
+    { id: "gemini-3.1-pro-high", name: "Gemini 3.1 Pro (High)" },
+    { id: "gemini-3.1-pro-low", name: "Gemini 3.1 Pro (Low)" },
+    { id: "gpt-oss-120b-medium", name: "GPT OSS 120B Medium" },
+  ],
+  claude: () => [
+    { id: "claude-opus-4-6", name: "Claude Opus 4.6" },
+    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+    { id: "claude-opus-4-5-20251101", name: "Claude Opus 4.5 (2025-11-01)" },
+    { id: "claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5 (2025-09-29)" },
+    { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5 (2025-10-01)" },
+  ],
   perplexity: () => [
     { id: "sonar", name: "Sonar (Fast Search)" },
     { id: "sonar-pro", name: "Sonar Pro (Advanced Search)" },
@@ -72,6 +101,7 @@ const STATIC_MODEL_PROVIDERS: Record<string, () => Array<{ id: string; name: str
     { id: "glm-4.7", name: "GLM 4.7" },
     { id: "kimi-k2.5", name: "Kimi K2.5" },
   ],
+  qoder: () => getStaticQoderModels(),
 };
 
 /**
@@ -100,32 +130,58 @@ const PROVIDER_MODELS_CONFIG: Record<string, ProviderModelsConfigEntry> = {
     parseResponse: (data) => data.data || [],
   },
   gemini: {
-    url: "https://generativelanguage.googleapis.com/v1beta/models",
+    url: "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
     method: "GET",
     headers: { "Content-Type": "application/json" },
     authQuery: "key", // Use query param for API key
-    parseResponse: (data) =>
-      (data.models || []).map((m) => ({
-        ...m,
-        id: (m.name || m.id || "").replace(/^models\//, ""),
-        name: m.displayName || (m.name || "").replace(/^models\//, ""),
-      })),
+    parseResponse: (data) => {
+      const METHOD_TO_ENDPOINT: Record<string, string> = {
+        generateContent: "chat",
+        embedContent: "embeddings",
+        predict: "images",
+        predictLongRunning: "images",
+        bidiGenerateContent: "audio",
+        generateAnswer: "chat",
+      };
+      const IGNORED_METHODS = new Set([
+        "countTokens",
+        "countTextTokens",
+        "createCachedContent",
+        "batchGenerateContent",
+        "asyncBatchEmbedContent",
+      ]);
+
+      return (data.models || []).map((m: Record<string, unknown>) => {
+        const methods: string[] = Array.isArray(m.supportedGenerationMethods)
+          ? m.supportedGenerationMethods
+          : [];
+        const endpoints = [
+          ...new Set(
+            methods
+              .filter((method) => !IGNORED_METHODS.has(method))
+              .map((method) => METHOD_TO_ENDPOINT[method] || "chat")
+          ),
+        ];
+        if (endpoints.length === 0) endpoints.push("chat");
+
+        return {
+          ...m,
+          id: ((m.name as string) || (m.id as string) || "").replace(/^models\//, ""),
+          name: (m.displayName as string) || ((m.name as string) || "").replace(/^models\//, ""),
+          supportedEndpoints: endpoints,
+          ...(typeof m.inputTokenLimit === "number" ? { inputTokenLimit: m.inputTokenLimit } : {}),
+          ...(typeof m.outputTokenLimit === "number"
+            ? { outputTokenLimit: m.outputTokenLimit }
+            : {}),
+          ...(typeof m.description === "string" ? { description: m.description } : {}),
+          ...(m.thinking === true ? { supportsThinking: true } : {}),
+        };
+      });
+    },
   },
-  "gemini-cli": {
-    url: "https://generativelanguage.googleapis.com/v1beta/models",
-    method: "GET",
-    headers: { "Content-Type": "application/json" },
-    authHeader: "Authorization",
-    authPrefix: "Bearer ",
-    parseResponse: (data) =>
-      (data.models || []).map((m) => ({
-        ...m,
-        id: (m.name || m.id || "").replace(/^models\//, ""),
-        name: m.displayName || (m.name || "").replace(/^models\//, ""),
-      })),
-  },
+  // gemini-cli handled via retrieveUserQuota (see GET handler)
   qwen: {
-    url: "https://portal.qwen.ai/v1/models",
+    url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
     method: "GET",
     headers: { "Content-Type": "application/json" },
     authHeader: "Authorization",
@@ -302,14 +358,31 @@ const PROVIDER_MODELS_CONFIG: Record<string, ProviderModelsConfigEntry> = {
     authPrefix: "Bearer ",
     parseResponse: (data) => data.data || data.models || [],
   },
+  "opencode-zen": {
+    url: "https://opencode.ai/zen/v1/models",
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    authHeader: "Authorization",
+    authPrefix: "Bearer ",
+    parseResponse: (data) => data.data || data.models || [],
+  },
 };
 
 /**
  * GET /api/providers/[id]/models - Get models list from provider
  */
-export async function GET(request, { params }) {
+export async function GET(
+  request: Request,
+  context: { params: Promise<{ id: string }> | { id: string } }
+) {
   try {
-    const { id } = await params;
+    const params = await context.params;
+    const { id } = params;
+
+    // Check if we should exclude hidden models (used by MCP tools to prevent hidden model leaks)
+    const { searchParams } = new URL(request.url);
+    const excludeHidden = searchParams.get("excludeHidden") === "true";
+
     const connection = await getProviderConnectionById(id);
 
     if (!connection) {
@@ -323,6 +396,13 @@ export async function GET(request, { params }) {
     if (!provider) {
       return NextResponse.json({ error: "Invalid connection provider" }, { status: 400 });
     }
+
+    const buildResponse = (payload: any, statusConfig?: ResponseInit) => {
+      if (excludeHidden && payload.models && Array.isArray(payload.models)) {
+        payload.models = payload.models.filter((m: any) => !getModelIsHidden(provider, m.id));
+      }
+      return NextResponse.json(payload, statusConfig);
+    };
 
     const connectionId = typeof connection.id === "string" ? connection.id : id;
     const apiKey = typeof connection.apiKey === "string" ? connection.apiKey : "";
@@ -408,7 +488,7 @@ export async function GET(request, { params }) {
           ? "local_catalog"
           : "api";
 
-      return NextResponse.json({
+      return buildResponse({
         provider,
         connectionId,
         models,
@@ -419,7 +499,110 @@ export async function GET(request, { params }) {
       });
     }
 
+    if (provider === "claude") {
+      return buildResponse({
+        provider,
+        connectionId,
+        models: STATIC_MODEL_PROVIDERS.claude(),
+      });
+    }
+
+    if (provider === "glm") {
+      const region = getGlmApiRegion(connection.providerSpecificData);
+      const url = GLM_MODELS_URLS[region];
+      const token = apiKey || accessToken;
+
+      const response = await fetch(url, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+      });
+
+      if (!response.ok) {
+        return NextResponse.json(
+          { error: `Failed to fetch models: ${response.status}` },
+          { status: response.status }
+        );
+      }
+
+      const data = await response.json();
+      const models = data.data || data.models || [];
+
+      return buildResponse({ provider, connectionId, models });
+    }
+
+    if (provider === "gemini-cli") {
+      // Gemini CLI doesn't have a /models endpoint. Instead, query the quota
+      // endpoint to discover available models from the quota buckets.
+      if (!accessToken) {
+        return NextResponse.json(
+          { error: "No access token for Gemini CLI. Please reconnect OAuth." },
+          { status: 400 }
+        );
+      }
+
+      const psd = asRecord(connection.providerSpecificData);
+      const projectId = connection.projectId || psd.projectId || null;
+
+      if (!projectId) {
+        return NextResponse.json(
+          { error: "Gemini CLI project ID not available. Please reconnect OAuth." },
+          { status: 400 }
+        );
+      }
+
+      try {
+        const quotaRes = await fetch(
+          "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ project: projectId }),
+            signal: AbortSignal.timeout(10000),
+          }
+        );
+
+        if (!quotaRes.ok) {
+          const errText = await quotaRes.text();
+          console.log(`[models] Gemini CLI quota fetch failed (${quotaRes.status}):`, errText);
+          return NextResponse.json(
+            { error: `Failed to fetch Gemini CLI models: ${quotaRes.status}` },
+            { status: quotaRes.status }
+          );
+        }
+
+        const quotaData = await quotaRes.json();
+        const buckets: Array<{ modelId?: string; tokenType?: string }> = quotaData.buckets || [];
+
+        const models = buckets
+          .filter((b) => b.modelId)
+          .map((b) => ({
+            id: b.modelId,
+            name: b.modelId,
+            owned_by: "google",
+          }));
+
+        return buildResponse({ provider, connectionId, models });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.log("[models] Gemini CLI model fetch error:", msg);
+        return NextResponse.json({ error: "Failed to fetch Gemini CLI models" }, { status: 500 });
+      }
+    }
+
     if (isAnthropicCompatibleProvider(provider)) {
+      if (isClaudeCodeCompatibleProvider(provider)) {
+        return NextResponse.json(
+          { error: `Provider ${provider} does not support models listing` },
+          { status: 400 }
+        );
+      }
+
       let baseUrl = getProviderBaseUrl(connection.providerSpecificData);
       if (!baseUrl) {
         return NextResponse.json(
@@ -434,13 +617,14 @@ export async function GET(request, { params }) {
       }
 
       const url = `${baseUrl}/models`;
+      const token = accessToken || apiKey;
       const response = await fetch(url, {
         method: "GET",
         headers: {
           "Content-Type": "application/json",
-          "x-api-key": apiKey,
+          ...(apiKey ? { "x-api-key": apiKey } : {}),
           "anthropic-version": "2023-06-01",
-          Authorization: `Bearer ${apiKey}`,
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
       });
 
@@ -456,7 +640,7 @@ export async function GET(request, { params }) {
       const data = await response.json();
       const models = data.data || data.models || [];
 
-      return NextResponse.json({
+      return buildResponse({
         provider,
         connectionId,
         models,
@@ -469,7 +653,7 @@ export async function GET(request, { params }) {
         ? STATIC_MODEL_PROVIDERS[provider as keyof typeof STATIC_MODEL_PROVIDERS]
         : undefined;
     if (staticModelsFn) {
-      return NextResponse.json({
+      return buildResponse({
         provider,
         connectionId,
         models: staticModelsFn(),
@@ -502,7 +686,7 @@ export async function GET(request, { params }) {
     // Build request URL
     let url = config.url;
     if (config.authQuery) {
-      url += `?${config.authQuery}=${token}`;
+      url += `${url.includes("?") ? "&" : "?"}${config.authQuery}=${token}`;
     }
 
     // Build headers
@@ -511,7 +695,7 @@ export async function GET(request, { params }) {
       headers[config.authHeader] = (config.authPrefix || "") + token;
     }
 
-    // Make request
+    // Make request (with pagination for providers that use nextPageToken, e.g. Gemini)
     const fetchOptions: any = {
       method: config.method,
       headers,
@@ -521,24 +705,55 @@ export async function GET(request, { params }) {
       fetchOptions.body = JSON.stringify(config.body);
     }
 
-    const response = await fetch(url, fetchOptions);
+    let allModels: any[] = [];
+    let pageUrl = url;
+    let pageCount = 0;
+    const MAX_PAGES = 20; // Safety limit
+    const seenTokens = new Set<string>();
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.log(`Error fetching models from ${provider}:`, errorText);
-      return NextResponse.json(
-        { error: `Failed to fetch models: ${response.status}` },
-        { status: response.status }
+    while (pageUrl && pageCount < MAX_PAGES) {
+      pageCount++;
+      const response = await fetch(pageUrl, {
+        ...fetchOptions,
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.log(`Error fetching models from ${provider}:`, errorText);
+        return NextResponse.json(
+          { error: `Failed to fetch models: ${response.status}` },
+          { status: response.status }
+        );
+      }
+
+      const data = await response.json();
+      const pageModels = config.parseResponse(data);
+      allModels = allModels.concat(pageModels);
+
+      const nextPageToken = data.nextPageToken;
+      if (!nextPageToken) break;
+      if (seenTokens.has(nextPageToken)) {
+        console.warn(`[models] ${provider}: duplicate nextPageToken detected, stopping pagination`);
+        break;
+      }
+      seenTokens.add(nextPageToken);
+      pageUrl = `${config.url}${config.url.includes("?") ? "&" : "?"}pageToken=${encodeURIComponent(nextPageToken)}`;
+      if (config.authQuery) {
+        pageUrl += `&${config.authQuery}=${token}`;
+      }
+    }
+
+    if (pageCount > 1) {
+      console.log(
+        `[models] ${provider}: fetched ${allModels.length} models across ${pageCount} pages`
       );
     }
 
-    const data = await response.json();
-    const models = config.parseResponse(data);
-
-    return NextResponse.json({
+    return buildResponse({
       provider,
       connectionId,
-      models,
+      models: allModels,
     });
   } catch (error) {
     console.log("Error fetching provider models:", error);

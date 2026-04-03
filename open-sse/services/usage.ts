@@ -86,7 +86,8 @@ function toDisplayLabel(value: string): string {
     .filter(Boolean)
     .map((part) => {
       if (/^pro\+$/i.test(part)) return "Pro+";
-      if (/^[a-z]{2,}$/.test(part)) return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
+      if (/^[a-z]{2,}$/.test(part))
+        return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
       return part;
     })
     .join(" ")
@@ -99,19 +100,72 @@ function shouldDisplayGitHubQuota(quota: UsageQuota | null): quota is UsageQuota
   return quota.total > 0 || quota.remainingPercentage !== undefined;
 }
 
+// GLM (Z.AI) quota API config
+const GLM_QUOTA_URLS: Record<string, string> = {
+  international: "https://api.z.ai/api/monitor/usage/quota/limit",
+  china: "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+};
+
+async function getGlmUsage(apiKey: string, providerSpecificData?: Record<string, unknown>) {
+  const region = providerSpecificData?.apiRegion || "international";
+  const quotaUrl = GLM_QUOTA_URLS[region] || GLM_QUOTA_URLS.international;
+
+  const res = await fetch(quotaUrl, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: "application/json",
+    },
+  });
+
+  if (!res.ok) {
+    if (res.status === 401) throw new Error("Invalid API key");
+    throw new Error(`GLM quota API error (${res.status})`);
+  }
+
+  const json = await res.json();
+  const data = toRecord(json.data);
+  const limits: unknown[] = Array.isArray(data.limits) ? data.limits : [];
+  const quotas: Record<string, UsageQuota> = {};
+
+  for (const limit of limits) {
+    const src = toRecord(limit);
+    if (src.type !== "TOKENS_LIMIT") continue;
+
+    const usedPercent = toNumber(src.percentage, 0);
+    const resetMs = toNumber(src.nextResetTime, 0);
+    const remaining = Math.max(0, 100 - usedPercent);
+
+    quotas["session"] = {
+      used: usedPercent,
+      total: 100,
+      remaining,
+      remainingPercentage: remaining,
+      resetAt: resetMs > 0 ? new Date(resetMs).toISOString() : null,
+      unlimited: false,
+    };
+  }
+
+  const levelRaw = typeof data.level === "string" ? data.level : "";
+  const plan = levelRaw
+    ? levelRaw.charAt(0).toUpperCase() + levelRaw.slice(1).toLowerCase()
+    : "Unknown";
+
+  return { plan, quotas };
+}
+
 /**
  * Get usage data for a provider connection
  * @param {Object} connection - Provider connection with accessToken
  * @returns {Promise<unknown>} Usage data with quotas
  */
 export async function getUsageForProvider(connection) {
-  const { provider, accessToken, providerSpecificData } = connection;
+  const { provider, accessToken, apiKey, providerSpecificData, projectId } = connection;
 
   switch (provider) {
     case "github":
       return await getGitHubUsage(accessToken, providerSpecificData);
     case "gemini-cli":
-      return await getGeminiUsage(accessToken);
+      return await getGeminiUsage(accessToken, providerSpecificData, projectId);
     case "antigravity":
       return await getAntigravityUsage(accessToken, undefined);
     case "claude":
@@ -124,8 +178,10 @@ export async function getUsageForProvider(connection) {
       return await getKimiUsage(accessToken);
     case "qwen":
       return await getQwenUsage(accessToken, providerSpecificData);
-    case "iflow":
+    case "qoder":
       return await getIflowUsage(accessToken);
+    case "glm":
+      return await getGlmUsage(apiKey, providerSpecificData);
     default:
       return { message: `Usage API not implemented for ${provider}` };
   }
@@ -139,24 +195,22 @@ function parseResetTime(resetValue) {
   if (!resetValue) return null;
 
   try {
-    // If it's already a Date object
+    let date;
     if (resetValue instanceof Date) {
-      return resetValue.toISOString();
+      date = resetValue;
+    } else if (typeof resetValue === "number") {
+      date = new Date(resetValue);
+    } else if (typeof resetValue === "string") {
+      date = new Date(resetValue);
+    } else {
+      return null;
     }
 
-    // If it's a number (Unix timestamp in milliseconds)
-    if (typeof resetValue === "number") {
-      return new Date(resetValue).toISOString();
-    }
+    // Epoch-zero (1970-01-01) means no scheduled reset — treat as null
+    if (date.getTime() <= 0) return null;
 
-    // If it's a string (ISO date or parseable date string)
-    if (typeof resetValue === "string") {
-      return new Date(resetValue).toISOString();
-    }
-
-    return null;
+    return date.toISOString();
   } catch (error) {
-    console.warn(`Failed to parse reset time: ${resetValue}`, error);
     return null;
   }
 }
@@ -200,7 +254,9 @@ async function getGitHubUsage(accessToken, providerSpecificData) {
     if (dataRecord.quota_snapshots) {
       // Paid plan format
       const snapshots = toRecord(dataRecord.quota_snapshots);
-      const resetAt = parseResetTime(getFieldValue(dataRecord, "quota_reset_date", "quotaResetDate"));
+      const resetAt = parseResetTime(
+        getFieldValue(dataRecord, "quota_reset_date", "quotaResetDate")
+      );
       const premiumQuota = formatGitHubQuotaSnapshot(snapshots.premium_interactions, resetAt);
       const chatQuota = formatGitHubQuotaSnapshot(snapshots.chat, resetAt);
       const completionsQuota = formatGitHubQuotaSnapshot(snapshots.completions, resetAt);
@@ -225,7 +281,11 @@ async function getGitHubUsage(accessToken, providerSpecificData) {
       // Free/limited plan format
       const monthlyQuotas = toRecord(dataRecord.monthly_quotas);
       const usedQuotas = toRecord(dataRecord.limited_user_quotas);
-      const resetDate = getFieldValue(dataRecord, "limited_user_reset_date", "limitedUserResetDate");
+      const resetDate = getFieldValue(
+        dataRecord,
+        "limited_user_reset_date",
+        "limitedUserResetDate"
+      );
       const resetAt = parseResetTime(resetDate);
       const quotas: Record<string, UsageQuota> = {};
 
@@ -327,11 +387,7 @@ function inferGitHubPlanName(data: JsonRecord, premiumQuota: UsageQuota | null):
     toNumber(getFieldValue(monthlyQuotas, "premium_interactions", "premiumInteractions"), 0);
   const chatTotal = toNumber(getFieldValue(monthlyQuotas, "chat", "chat"), 0);
 
-  if (
-    combined.includes("PRO+") ||
-    combined.includes("PRO_PLUS") ||
-    combined.includes("PROPLUS")
-  ) {
+  if (combined.includes("PRO+") || combined.includes("PRO_PLUS") || combined.includes("PROPLUS")) {
     return "Copilot Pro+";
   }
   if (combined.includes("ENTERPRISE")) return "Copilot Enterprise";
@@ -359,34 +415,178 @@ function inferGitHubPlanName(data: JsonRecord, premiumQuota: UsageQuota | null):
   return "GitHub Copilot";
 }
 
+// ── Gemini CLI subscription info cache ──────────────────────────────────────
+// Prevents duplicate loadCodeAssist calls within the same quota cycle.
+// Key: accessToken → { data, fetchedAt }
+const _geminiCliSubCache = new Map();
+const GEMINI_CLI_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 /**
- * Gemini CLI Usage (Google Cloud)
+ * Gemini CLI Usage — fetch per-model quota from Cloud Code Assist API.
+ * Gemini CLI and Antigravity share the same upstream (cloudcode-pa.googleapis.com),
+ * so this follows the same pattern as getAntigravityUsage().
  */
-async function getGeminiUsage(accessToken) {
+async function getGeminiUsage(accessToken, providerSpecificData?, connectionProjectId?) {
+  if (!accessToken) {
+    return { plan: "Free", message: "Gemini CLI access token not available." };
+  }
+
   try {
-    // Gemini CLI uses Google Cloud quotas
-    // Try to get quota info from Cloud Resource Manager
+    const subscriptionInfo = await getGeminiCliSubscriptionInfoCached(accessToken);
+    const projectId =
+      connectionProjectId ||
+      providerSpecificData?.projectId ||
+      subscriptionInfo?.cloudaicompanionProject ||
+      null;
+
+    const plan = getGeminiCliPlanLabel(subscriptionInfo);
+
+    if (!projectId) {
+      return { plan, message: "Gemini CLI project ID not available." };
+    }
+
+    // Use retrieveUserQuota (same endpoint as Gemini CLI /stats command).
+    // Returns per-model buckets with remainingFraction and resetTime.
     const response = await fetch(
-      "https://cloudresourcemanager.googleapis.com/v1/projects?filter=lifecycleState:ACTIVE",
+      "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
       {
+        method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
-          Accept: "application/json",
+          "Content-Type": "application/json",
         },
+        body: JSON.stringify({ project: projectId }),
+        signal: AbortSignal.timeout(10000),
       }
     );
 
     if (!response.ok) {
-      // Quota API may not be accessible, return generic message
-      return {
-        message: "Gemini CLI uses Google Cloud quotas. Check Google Cloud Console for details.",
-      };
+      return { plan, message: `Gemini CLI quota error (${response.status}).` };
     }
 
-    return { message: "Gemini CLI connected. Usage tracked via Google Cloud Console." };
+    const data = await response.json();
+    const quotas: Record<string, UsageQuota> = {};
+
+    if (Array.isArray(data.buckets)) {
+      for (const bucket of data.buckets) {
+        if (!bucket.modelId || bucket.remainingFraction == null) continue;
+
+        const remainingFraction = toNumber(bucket.remainingFraction, 0);
+        const remainingPercentage = remainingFraction * 100;
+        const QUOTA_NORMALIZED_BASE = 1000;
+        const total = QUOTA_NORMALIZED_BASE;
+        const remaining = Math.round(total * remainingFraction);
+        const used = Math.max(0, total - remaining);
+
+        quotas[bucket.modelId] = {
+          used,
+          total,
+          resetAt: parseResetTime(bucket.resetTime),
+          remainingPercentage,
+          unlimited: false,
+        };
+      }
+    }
+
+    return { plan, quotas };
   } catch (error) {
-    return { message: "Unable to fetch Gemini usage. Check Google Cloud Console." };
+    return { message: `Gemini CLI error: ${(error as Error).message}` };
   }
+}
+
+/**
+ * Get Gemini CLI subscription info (cached, 5 min TTL)
+ */
+async function getGeminiCliSubscriptionInfoCached(accessToken) {
+  const cacheKey = accessToken;
+  const cached = _geminiCliSubCache.get(cacheKey);
+
+  if (cached && Date.now() - cached.fetchedAt < GEMINI_CLI_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const data = await getGeminiCliSubscriptionInfo(accessToken);
+  _geminiCliSubCache.set(cacheKey, { data, fetchedAt: Date.now() });
+  return data;
+}
+
+/**
+ * Get Gemini CLI subscription info using correct headers.
+ */
+async function getGeminiCliSubscriptionInfo(accessToken) {
+  try {
+    const response = await fetch("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        metadata: {
+          ideType: "IDE_UNSPECIFIED",
+          platform: "PLATFORM_UNSPECIFIED",
+          pluginType: "GEMINI",
+        },
+      }),
+    });
+
+    if (!response.ok) return null;
+
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Map Gemini CLI subscription tier to display label (same tiers as Antigravity).
+ */
+function getGeminiCliPlanLabel(subscriptionInfo) {
+  if (!subscriptionInfo || Object.keys(subscriptionInfo).length === 0) return "Free";
+
+  let tierId = "";
+  if (Array.isArray(subscriptionInfo.allowedTiers)) {
+    for (const tier of subscriptionInfo.allowedTiers) {
+      if (tier.isDefault && tier.id) {
+        tierId = tier.id.trim().toUpperCase();
+        break;
+      }
+    }
+  }
+
+  if (!tierId) {
+    tierId = (subscriptionInfo.currentTier?.id || "").toUpperCase();
+  }
+
+  if (tierId) {
+    if (tierId.includes("ULTRA")) return "Ultra";
+    if (tierId.includes("PRO")) return "Pro";
+    if (tierId.includes("ENTERPRISE")) return "Enterprise";
+    if (tierId.includes("BUSINESS") || tierId.includes("STANDARD")) return "Business";
+    if (tierId.includes("FREE") || tierId.includes("INDIVIDUAL") || tierId.includes("LEGACY"))
+      return "Free";
+  }
+
+  const tierName =
+    subscriptionInfo.currentTier?.name ||
+    subscriptionInfo.currentTier?.displayName ||
+    subscriptionInfo.subscriptionType ||
+    subscriptionInfo.tier ||
+    "";
+  const upper = tierName.toUpperCase();
+
+  if (upper.includes("ULTRA")) return "Ultra";
+  if (upper.includes("PRO")) return "Pro";
+  if (upper.includes("ENTERPRISE")) return "Enterprise";
+  if (upper.includes("STANDARD") || upper.includes("BUSINESS")) return "Business";
+  if (upper.includes("INDIVIDUAL") || upper.includes("FREE")) return "Free";
+
+  if (subscriptionInfo.currentTier?.upgradeSubscriptionType) return "Free";
+  if (tierName) {
+    return tierName.charAt(0).toUpperCase() + tierName.slice(1).toLowerCase();
+  }
+
+  return "Free";
 }
 
 // ── Antigravity subscription info cache ──────────────────────────────────────
@@ -457,15 +657,16 @@ function getAntigravityPlanLabel(subscriptionInfo) {
 
 /**
  * Antigravity Usage - Fetch quota from Google Cloud Code API
- * Now calls loadCodeAssist ONCE (cached) and reuses for projectId + plan.
+ * Uses fetchAvailableModels API which returns ALL models (including Claude)
+ * with per-model quotaInfo (remainingFraction, resetTime).
+ * retrieveUserQuota only returns Gemini models — not suitable for Antigravity.
  */
 async function getAntigravityUsage(accessToken, providerSpecificData) {
   try {
-    // Single cached call for subscription info (provides both projectId and plan)
     const subscriptionInfo = await getAntigravitySubscriptionInfoCached(accessToken);
     const projectId = subscriptionInfo?.cloudaicompanionProject || null;
 
-    // Fetch quota data
+    // Fetch model list with quota info from fetchAvailableModels
     const response = await fetch(ANTIGRAVITY_CONFIG.quotaApiUrl, {
       method: "POST",
       headers: {
@@ -474,6 +675,7 @@ async function getAntigravityUsage(accessToken, providerSpecificData) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(projectId ? { project: projectId } : {}),
+      signal: AbortSignal.timeout(10000),
     });
 
     if (response.status === 403) {
@@ -489,52 +691,59 @@ async function getAntigravityUsage(accessToken, providerSpecificData) {
     const modelEntries = toRecord(dataObj.models);
     const quotas: Record<string, UsageQuota> = {};
 
-    // Parse model quotas (inspired by vscode-antigravity-cockpit)
-    if (Object.keys(modelEntries).length > 0) {
-      // Filter only recommended/important models (must match PROVIDER_MODELS ag ids)
-      const importantModels = [
-        "claude-opus-4-6-thinking",
-        "claude-sonnet-4-6",
-        "gemini-3.1-pro-high",
-        "gemini-3.1-pro-low",
-        "gemini-3-flash",
-        "gpt-oss-120b-medium",
-      ];
+    // Models excluded from quota display — internal/special-purpose models that
+    // the Antigravity API returns quota for but are not user-callable via
+    // generateContent.  Matches CLIProxyAPI's hardcoded exclusion list.
+    const ANTIGRAVITY_EXCLUDED_MODELS = new Set([
+      "chat_20706",
+      "chat_23310",
+      "tab_flash_lite_preview",
+      "tab_jump_flash_lite_preview",
+      "gemini-2.5-flash-thinking",
+      "gemini-2.5-pro", // browser subagent model — not user-callable
+      "gemini-2.5-flash", // internal — quota always exhausted on free tier
+      "gemini-2.5-flash-lite", // internal — quota always exhausted on free tier
+      "gemini-2.5-flash-preview-image-generation", // image-gen only, not usable for chat
+      "gemini-3.1-flash-image-preview", // image-gen preview, not usable for chat
+      "gemini-3-flash-agent", // internal agent model — not user-callable
+      "gemini-3.1-flash-lite", // not usable for chat
+      "gemini-3-pro-low", // not usable for chat
+      "gemini-3-pro-high", // not usable for chat
+    ]);
 
-      for (const [modelKey, infoValue] of Object.entries(modelEntries)) {
-        const info = toRecord(infoValue);
-        const quotaInfo = toRecord(info.quotaInfo);
-        // Skip models without quota info
-        if (Object.keys(quotaInfo).length === 0) {
-          continue;
-        }
+    // Parse per-model quota info from fetchAvailableModels response.
+    for (const [modelKey, infoValue] of Object.entries(modelEntries)) {
+      const info = toRecord(infoValue);
+      const quotaInfo = toRecord(info.quotaInfo);
 
-        // Skip internal models and non-important models
-        if (info.isInternal === true || !importantModels.includes(modelKey)) {
-          continue;
-        }
-
-        const remainingFraction = toNumber(quotaInfo.remainingFraction, 0);
-        const remainingPercentage = remainingFraction * 100;
-
-        // Convert percentage to used/total for UI compatibility
-        // QUOTA_NORMALIZED_BASE is an arbitrary base for converting fractions
-        // to integer used/total pairs that the dashboard UI can display as bars.
-        const QUOTA_NORMALIZED_BASE = 1000;
-        const total = QUOTA_NORMALIZED_BASE;
-        const remaining = Math.round(total * remainingFraction);
-        const used = total - remaining;
-
-        // Use modelKey as key (matches PROVIDER_MODELS id)
-        quotas[modelKey] = {
-          used,
-          total,
-          resetAt: parseResetTime(quotaInfo.resetTime),
-          remainingPercentage,
-          unlimited: false,
-          displayName: typeof info.displayName === "string" ? info.displayName : modelKey,
-        };
+      // Skip internal, excluded, and models without quota info
+      if (
+        info.isInternal === true ||
+        ANTIGRAVITY_EXCLUDED_MODELS.has(modelKey) ||
+        Object.keys(quotaInfo).length === 0
+      ) {
+        continue;
       }
+
+      const rawFraction = toNumber(quotaInfo.remainingFraction, -1);
+      const resetAt = parseResetTime(quotaInfo.resetTime);
+      // Default to 100% when the API doesn't report a fraction
+      const remainingFraction = rawFraction < 0 ? 1 : rawFraction;
+      // Models with no resetTime and full remaining are unlimited (e.g. tab-completion models)
+      const isUnlimited = !resetAt && remainingFraction >= 1;
+      const remainingPercentage = remainingFraction * 100;
+      const QUOTA_NORMALIZED_BASE = 1000;
+      const total = QUOTA_NORMALIZED_BASE;
+      const remaining = Math.round(total * remainingFraction);
+      const used = isUnlimited ? 0 : Math.max(0, total - remaining);
+
+      quotas[modelKey] = {
+        used,
+        total: isUnlimited ? 0 : total,
+        resetAt,
+        remainingPercentage: isUnlimited ? 100 : remainingPercentage,
+        unlimited: isUnlimited,
+      };
     }
 
     return {
@@ -543,7 +752,7 @@ async function getAntigravityUsage(accessToken, providerSpecificData) {
       subscriptionInfo,
     };
   } catch (error) {
-    return { message: `Antigravity error: ${error.message}` };
+    return { message: `Antigravity error: ${(error as Error).message}` };
   }
 }
 
@@ -655,8 +864,18 @@ async function getClaudeUsage(accessToken) {
         }
       }
 
+      // Try to extract plan tier from the OAuth response
+      const planRaw =
+        typeof data.tier === "string"
+          ? data.tier
+          : typeof data.plan === "string"
+            ? data.plan
+            : typeof data.subscription_type === "string"
+              ? data.subscription_type
+              : null;
+
       return {
-        plan: "Claude Code",
+        plan: planRaw || "Claude Code",
         quotas,
         extraUsage: data.extra_usage ?? null,
       };
@@ -843,7 +1062,7 @@ async function getCodexUsage(accessToken, providerSpecificData: Record<string, u
       quotas,
     };
   } catch (error) {
-    throw new Error(`Failed to fetch Codex usage: ${error.message}`);
+    return { message: `Failed to fetch Codex usage: ${(error as Error).message}` };
   }
 }
 
@@ -1115,13 +1334,13 @@ async function getQwenUsage(accessToken, providerSpecificData) {
 }
 
 /**
- * iFlow Usage
+ * Qoder Usage
  */
 async function getIflowUsage(accessToken) {
   try {
-    // iFlow may have usage endpoint
-    return { message: "iFlow connected. Usage tracked per request." };
+    // Qoder may have usage endpoint
+    return { message: "Qoder connected. Usage tracked per request." };
   } catch (error) {
-    return { message: "Unable to fetch iFlow usage." };
+    return { message: "Unable to fetch Qoder usage." };
   }
 }

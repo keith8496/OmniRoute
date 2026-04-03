@@ -1,8 +1,10 @@
+import { randomUUID } from "crypto";
 import {
   getProviderConnections,
   validateApiKey,
   updateProviderConnection,
   getSettings,
+  getCachedSettings,
 } from "@/lib/localDb";
 import { getQuotaWindowStatus, isAccountQuotaExhausted } from "@/domain/quotaCache";
 import {
@@ -13,8 +15,12 @@ import {
   checkFallbackError,
   isModelLocked,
   lockModel,
+  hasPerModelQuota,
 } from "@omniroute/open-sse/services/accountFallback.ts";
-import { isLocalProvider } from "@omniroute/open-sse/config/providerRegistry.ts";
+import {
+  isLocalProvider,
+  getPassthroughProviders,
+} from "@omniroute/open-sse/config/providerRegistry.ts";
 import { COOLDOWN_MS } from "@omniroute/open-sse/config/constants.ts";
 import { getCodexModelScope } from "@omniroute/open-sse/executors/codex.ts";
 import * as log from "../utils/logger";
@@ -52,6 +58,11 @@ interface RecoverableConnectionState {
   errorCode?: string | number | null;
   lastErrorType?: string | null;
   lastErrorSource?: string | null;
+}
+
+interface CredentialSelectionOptions {
+  allowSuppressedConnections?: boolean;
+  bypassQuotaPolicy?: boolean;
 }
 
 const CODEX_QUOTA_THRESHOLD_PERCENT = 90;
@@ -302,6 +313,19 @@ const markMutexes = new Map<string, Promise<void>>();
 export { fisherYatesShuffle, getNextFromDeckSync as getNextFromDeck };
 
 /**
+ * Resolve provider aliases (e.g., nvidia -> nvidia_nim) for DB lookup
+ */
+function getProviderSearchPool(provider: string): string[] {
+  if (provider === "nvidia") {
+    return ["nvidia", "nvidia_nim"];
+  }
+  if (provider === "nvidia_nim") {
+    return ["nvidia_nim", "nvidia"];
+  }
+  return [provider];
+}
+
+/**
  * Get provider credentials from localDb
  * Filters out unavailable accounts and returns the selected account based on strategy
  * @param {string} provider - Provider name
@@ -311,7 +335,8 @@ export async function getProviderCredentials(
   provider: string,
   excludeConnectionId: string | null = null,
   allowedConnections: string[] | null = null,
-  requestedModel: string | null = null
+  requestedModel: string | null = null,
+  options: CredentialSelectionOptions = {}
 ) {
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
@@ -323,7 +348,16 @@ export async function getProviderCredentials(
   try {
     await currentMutex;
 
-    const connectionsRaw = await getProviderConnections({ provider, isActive: true });
+    const allowSuppressedConnections = options.allowSuppressedConnections === true;
+    const bypassQuotaPolicy = options.bypassQuotaPolicy === true;
+
+    // Fix #922: Check for aliases (nvidia/nvidia_nim) to ensure credentials are found
+    const providersToSearch = getProviderSearchPool(provider);
+    const connectionResults = await Promise.all(
+      providersToSearch.map((p) => getProviderConnections({ provider: p, isActive: true }))
+    );
+    const connectionsRaw = connectionResults.filter(Array.isArray).flat();
+
     let connections = (Array.isArray(connectionsRaw) ? connectionsRaw : [])
       .map(toProviderConnection)
       .filter((conn) => conn.id.length > 0);
@@ -338,7 +372,11 @@ export async function getProviderCredentials(
 
     if (connections.length === 0) {
       // Check all connections (including inactive) to see if rate limited
-      const allConnectionsRaw = await getProviderConnections({ provider });
+      // Fix #922: Also search aliases here
+      const allConnectionsResults = await Promise.all(
+        providersToSearch.map((p) => getProviderConnections({ provider: p }))
+      );
+      const allConnectionsRaw = allConnectionsResults.filter(Array.isArray).flat();
       const allConnections = (Array.isArray(allConnectionsRaw) ? allConnectionsRaw : [])
         .map(toProviderConnection)
         .filter((conn) => conn.id.length > 0);
@@ -368,12 +406,39 @@ export async function getProviderCredentials(
       return null;
     }
 
+    // Auto-decay backoffLevel for accounts whose rateLimitedUntil has passed.
+    // Without this, high backoffLevel permanently deprioritizes accounts even
+    // after the rate limit window expires, creating a deadlock where the account
+    // needs a successful request to reset but never gets selected.
+    for (const c of connections) {
+      if (
+        c.backoffLevel > 0 &&
+        !isTerminalConnectionStatus(c) &&
+        !isAccountUnavailable(c.rateLimitedUntil)
+      ) {
+        c.backoffLevel = 0;
+        updateProviderConnection(c.id, {
+          backoffLevel: 0,
+          testStatus: "active",
+          lastError: null,
+          lastErrorAt: null,
+          lastErrorType: null,
+          lastErrorSource: null,
+          errorCode: null,
+        }).catch(() => {});
+      }
+    }
+
     // Filter out unavailable accounts and excluded connection
     const availableConnections = connections.filter((c) => {
       if (excludeConnectionId && c.id === excludeConnectionId) return false;
-      if (isAccountUnavailable(c.rateLimitedUntil)) return false;
-      if (isTerminalConnectionStatus(c)) return false;
-      if (provider === "codex" && isCodexScopeUnavailable(c, requestedModel)) return false;
+      if (!allowSuppressedConnections) {
+        if (isAccountUnavailable(c.rateLimitedUntil)) return false;
+        if (isTerminalConnectionStatus(c)) return false;
+        if (provider === "codex" && isCodexScopeUnavailable(c, requestedModel)) return false;
+        // Per-model lockout: if this specific model is locked on this connection, skip it
+        if (requestedModel && isModelLocked(provider, c.id, requestedModel)) return false;
+      }
       return true;
     });
 
@@ -389,13 +454,23 @@ export async function getProviderCredentials(
       if (excluded || rateLimited) {
         log.debug(
           "AUTH",
-          `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${rateLimited ? `rateLimited until ${c.rateLimitedUntil}` : ""}`
+          `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${rateLimited ? `rateLimited until ${c.rateLimitedUntil}` : ""}${allowSuppressedConnections && rateLimited ? " (retained for combo live test)" : ""}`
         );
       } else if (terminalStatus) {
-        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | skipped terminal status=${c.testStatus}`);
+        log.debug(
+          "AUTH",
+          allowSuppressedConnections
+            ? `  → ${c.id?.slice(0, 8)} | retained terminal status=${c.testStatus} for combo live test`
+            : `  → ${c.id?.slice(0, 8)} | skipped terminal status=${c.testStatus}`
+        );
       } else if (codexScopeLimited) {
         const scopeUntil = getCodexScopeRateLimitedUntil(c.providerSpecificData, requestedModel);
-        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | codex scope-limited until ${scopeUntil}`);
+        log.debug(
+          "AUTH",
+          allowSuppressedConnections
+            ? `  → ${c.id?.slice(0, 8)} | retained codex scope-limited account until ${scopeUntil} for combo live test`
+            : `  → ${c.id?.slice(0, 8)} | codex scope-limited until ${scopeUntil}`
+        );
       }
     });
 
@@ -438,17 +513,21 @@ export async function getProviderCredentials(
       resetAt: string | null;
     }> = [];
 
-    policyEligibleConnections = availableConnections.filter((connection) => {
-      const evaluation = evaluateQuotaLimitPolicy(provider, connection);
-      if (!evaluation.blocked) return true;
+    if (!bypassQuotaPolicy) {
+      policyEligibleConnections = availableConnections.filter((connection) => {
+        const evaluation = evaluateQuotaLimitPolicy(provider, connection);
+        if (!evaluation.blocked) return true;
 
-      blockedByPolicy.push({
-        id: connection.id,
-        reasons: evaluation.reasons,
-        resetAt: evaluation.resetAt,
+        blockedByPolicy.push({
+          id: connection.id,
+          reasons: evaluation.reasons,
+          resetAt: evaluation.resetAt,
+        });
+        return false;
       });
-      return false;
-    });
+    } else if (availableConnections.length > 0) {
+      log.debug("AUTH", `${provider} | bypassing quota policy for combo live test`);
+    }
 
     if (blockedByPolicy.length > 0) {
       log.info(
@@ -582,8 +661,11 @@ export async function getProviderCredentials(
       if (orderedConnections.length <= 2) {
         connection = orderedConnections[0];
       } else {
-        const i = Math.floor(Math.random() * orderedConnections.length);
-        let j = Math.floor(Math.random() * (orderedConnections.length - 1));
+        const i =
+          parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) % orderedConnections.length;
+        let j =
+          parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) %
+          (orderedConnections.length - 1);
         if (j >= i) j++;
         const a = orderedConnections[i];
         const b = orderedConnections[j];
@@ -594,7 +676,8 @@ export async function getProviderCredentials(
       }
     } else if (strategy === "random") {
       // Random: Fisher-Yates-inspired random pick
-      const idx = Math.floor(Math.random() * orderedConnections.length);
+      const idx =
+        parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) % orderedConnections.length;
       connection = orderedConnections[idx];
     } else if (strategy === "least-used") {
       // Least Used: pick the one with oldest lastUsedAt
@@ -675,6 +758,27 @@ export async function markAccountUnavailable(
   try {
     await currentMutex;
 
+    // ── Per-model lockout for providers with independent model quotas ──
+    // Providers like Gemini AI Studio have per-model quotas. A 429/404 on one
+    // model must NOT lock out other models on the same API key.
+    if (hasPerModelQuota(provider) && model && (status === 429 || status === 404)) {
+      const reason = status === 404 ? "not_found" : "rate_limited";
+      const cooldown = status === 404 ? COOLDOWN_MS.notFoundLocal : COOLDOWN_MS.rateLimit;
+      lockModel(provider, connectionId, model, reason, cooldown);
+      // Update last error for observability (without changing terminal status)
+      updateProviderConnection(connectionId, {
+        lastErrorType: reason,
+        lastError: `Model ${model} ${reason}`,
+        lastErrorAt: new Date().toISOString(),
+        errorCode: status,
+      }).catch(() => {});
+      log.info(
+        "AUTH",
+        `Model-only lockout for ${provider}:${model} — ${status} ${reason} ${Math.ceil(cooldown / 1000)}s (connection stays active)`
+      );
+      return { shouldFallback: true, cooldownMs: cooldown };
+    }
+
     // Read current connection to get backoffLevel
     const connectionsRaw = await getProviderConnections({ provider });
     const connections = (Array.isArray(connectionsRaw) ? connectionsRaw : [])
@@ -725,30 +829,54 @@ export async function markAccountUnavailable(
       }
     }
 
-    const { shouldFallback, cooldownMs, newBackoffLevel, reason } = checkFallbackError(
+    const result = checkFallbackError(
       status,
       errorText,
       backoffLevel,
       model,
       provider // ← Now passes provider for profile-aware cooldowns
     );
+    const { shouldFallback, cooldownMs, newBackoffLevel, reason } = result;
     if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
-    // ── Local provider 404: model-only lockout, connection stays active ──
-    // Detection: URL-based only (apiKey===null heuristic was too broad — could match
-    // cloud providers with non-standard auth stored in providerSpecificData).
+    // ── 404 model-only lockout: connection stays active ──
+    // For local providers (detected by URL) and cloud providers with passthrough models
+    // (like Antigravity), a 404 means the specific model doesn't exist or isn't available
+    // for this account — it should NOT lock out the entire connection.
     const connBaseUrl = (conn?.providerSpecificData as Record<string, unknown>)?.baseUrl as
       | string
       | undefined;
 
-    if (isLocalProvider(connBaseUrl) && status === 404 && provider && model) {
+    const isPassthroughProvider = provider && getPassthroughProviders().has(provider);
+    const isPerModelQuotaProvider = hasPerModelQuota(provider);
+    if (
+      (isLocalProvider(connBaseUrl) || isPerModelQuotaProvider) &&
+      status === 404 &&
+      provider &&
+      model
+    ) {
       const localCooldown = COOLDOWN_MS.notFoundLocal;
-      lockModel(provider, connectionId, model, "local_not_found", localCooldown);
+      lockModel(provider, connectionId, model, "not_found", localCooldown);
       log.info(
         "AUTH",
-        `Local 404 for ${model} — model-only lockout ${localCooldown / 1000}s (connection stays active)`
+        `Model-only lockout for ${model} — 404 lockout ${localCooldown / 1000}s (connection stays active)`
       );
       return { shouldFallback: true, cooldownMs: localCooldown };
+    }
+
+    // ── 429 model-only lockout for per-model quota providers ──
+    // For providers where each model has independent quota (passthrough providers,
+    // Gemini AI Studio), a 429 on one model should NOT lock out the entire connection
+    // — other models may still have quota available. Use lockModel() instead of
+    // connection-wide rateLimitedUntil.
+    if (isPerModelQuotaProvider && status === 429 && provider && model) {
+      const modelCooldown = cooldownMs || COOLDOWN_MS.rateLimit;
+      lockModel(provider, connectionId, model, reason || "rate_limited", modelCooldown);
+      log.info(
+        "AUTH",
+        `Model-only lockout for ${model} — 429 rate limit ${Math.ceil(modelCooldown / 1000)}s (connection stays active)`
+      );
+      return { shouldFallback: true, cooldownMs: modelCooldown };
     }
 
     const rateLimitedUntil = getUnavailableUntil(cooldownMs);
@@ -796,6 +924,28 @@ export async function markAccountUnavailable(
       lastErrorAt: new Date().toISOString(),
       backoffLevel: newBackoffLevel ?? backoffLevel,
     });
+
+    // T-AUTODISABLE: If auto-disable setting is enabled and error is permanent/terminal,
+    // mark account as inactive so it is never retried again.
+    // Uses getCachedSettings() to avoid DB overhead on hot error path.
+    // NOTE: For permanent bans we disable immediately — no threshold needed,
+    // because a permanent ban (403 "Verify your account" / ToS violation) will
+    // NEVER recover, so retrying is pointless regardless of attempt count.
+    if (result.permanent) {
+      try {
+        const settings = await getCachedSettings();
+        const autoDisableEnabled = settings.autoDisableBannedAccounts ?? false;
+        if (autoDisableEnabled) {
+          await updateProviderConnection(connectionId, { isActive: false });
+          log.info(
+            "AUTH",
+            `Auto-disabled ${connectionId.slice(0, 8)} — permanent ban detected (autoDisableBannedAccounts=true)`
+          );
+        }
+      } catch (e) {
+        log.info("AUTH", `Auto-disable check failed (non-fatal): ${e}`);
+      }
+    }
 
     // Per-model lockout: lock the specific model if known
     if (provider && model && cooldownMs > 0) {

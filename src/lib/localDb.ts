@@ -48,6 +48,7 @@ export {
   getCustomModels,
   getAllCustomModels,
   addCustomModel,
+  replaceCustomModels,
   removeCustomModel,
   updateCustomModel,
   getModelCompatOverrides,
@@ -55,9 +56,17 @@ export {
   removeModelCompatOverride,
   getModelNormalizeToolCallId,
   getModelPreserveOpenAIDeveloperRole,
+  getModelUpstreamExtraHeaders,
+  getModelIsHidden,
+
+  // Synced Available Models
+  getSyncedAvailableModels,
+  getAllSyncedAvailableModels,
+  replaceSyncedAvailableModelsForConnection,
+  deleteSyncedAvailableModelsForConnection,
 } from "./db/models";
 
-export type { ModelCompatPerProtocol, ModelCompatPatch } from "./db/models";
+export type { ModelCompatPerProtocol, ModelCompatPatch, SyncedAvailableModel } from "./db/models";
 
 export {
   // Combos
@@ -88,6 +97,10 @@ export {
   getSettings,
   updateSettings,
   isCloudEnabled,
+
+  // LKGP (Last Known Good Provider) (#919)
+  getLKGP,
+  setLKGP,
 
   // Pricing
   getPricing,
@@ -171,3 +184,70 @@ export type {
   QuotaCheckResult,
   IssueKeyParams,
 } from "./db/registeredKeys";
+
+export {
+  // Model-Combo Mappings (#563)
+  getModelComboMappings,
+  getModelComboMappingById,
+  createModelComboMapping,
+  updateModelComboMapping,
+  deleteModelComboMapping,
+  resolveComboForModel,
+} from "./db/modelComboMappings";
+
+export type { ModelComboMapping } from "./db/modelComboMappings";
+
+export {
+  // Webhooks
+  getWebhooks,
+  getWebhook,
+  getEnabledWebhooks,
+  createWebhook,
+  updateWebhook as updateWebhookRecord,
+  deleteWebhook,
+  recordWebhookDelivery,
+  disableWebhooksWithHighFailures,
+} from "./db/webhooks";
+
+export type { Webhook } from "./db/webhooks";
+
+export {
+  saveQuotaSnapshot,
+  getQuotaSnapshots,
+  getAggregatedSnapshots,
+  cleanupOldSnapshots,
+} from "./db/quotaSnapshots";
+
+export type { QuotaSnapshotRow, ProviderUtilizationPoint } from "@/shared/types/utilization";
+
+export {
+  getVersionManagerStatus,
+  getVersionManagerTool,
+  upsertVersionManagerTool,
+  updateVersionManagerTool,
+  deleteVersionManagerTool,
+  updateToolHealth,
+  updateToolVersion,
+  setToolStatus,
+} from "./db/versionManager";
+
+export {
+  getUpstreamProxyConfigs,
+  getUpstreamProxyConfig,
+  upsertUpstreamProxyConfig,
+  updateUpstreamProxyConfig,
+  deleteUpstreamProxyConfig,
+  getProvidersByMode,
+  getFallbackChainForProvider,
+  validateProxyUrl,
+} from "./db/upstreamProxy";
+
+export {
+  getProviderLimitsCache,
+  getAllProviderLimitsCache,
+  setProviderLimitsCache,
+  setProviderLimitsCacheBatch,
+  deleteProviderLimitsCache,
+} from "./db/providerLimits";
+
+export type { ProviderLimitsCacheEntry } from "./db/providerLimits";

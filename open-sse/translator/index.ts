@@ -2,6 +2,11 @@ import { FORMATS } from "./formats.ts";
 import { ensureToolCallIds, fixMissingToolResponses } from "./helpers/toolCallHelper.ts";
 import { prepareClaudeRequest } from "./helpers/claudeHelper.ts";
 import { filterToOpenAIFormat } from "./helpers/openaiHelper.ts";
+import {
+  coerceToolSchemas,
+  injectEmptyReasoningContentForToolCalls,
+  sanitizeToolDescriptions,
+} from "./helpers/schemaCoercion.ts";
 import { getRequestTranslator, getResponseTranslator } from "./registry.ts";
 import { bootstrapTranslatorRegistry } from "./bootstrap.ts";
 import { normalizeThinkingConfig } from "../services/provider.ts";
@@ -68,6 +73,7 @@ function normalizeOpenAIResponsesRequest(body) {
 
 /** @param options.normalizeToolCallId - When true, use 9-char tool call ids (e.g. Mistral); when false, leave ids as-is */
 /** @param options.preserveDeveloperRole - undefined/true: keep developer for OpenAI format (default); false: map to system */
+/** @param options.preserveCacheControl - When true, preserve client-side cache_control markers (for Claude Code, etc.) */
 // Translate request: source -> openai -> target
 export function translateRequest(
   sourceFormat,
@@ -78,7 +84,11 @@ export function translateRequest(
   credentials = null,
   provider = null,
   reqLogger = null,
-  options?: { normalizeToolCallId?: boolean; preserveDeveloperRole?: boolean }
+  options?: {
+    normalizeToolCallId?: boolean;
+    preserveDeveloperRole?: boolean;
+    preserveCacheControl?: boolean;
+  }
 ) {
   let result = body;
   const use9CharId = options?.normalizeToolCallId === true;
@@ -144,8 +154,13 @@ export function translateRequest(
   }
 
   // Final step: prepare request for Claude format endpoints
-  if (targetFormat === FORMATS.CLAUDE && sourceFormat !== FORMATS.CLAUDE) {
-    result = prepareClaudeRequest(result, provider);
+  // Preserve cache_control when:
+  // 1. Claude passthrough mode (Claude → Claude), OR
+  // 2. Explicitly requested via options (for caching-aware clients like Claude Code)
+  if (targetFormat === FORMATS.CLAUDE) {
+    const isClaudePassthrough = sourceFormat === FORMATS.CLAUDE;
+    const preserveCache = isClaudePassthrough || options?.preserveCacheControl === true;
+    result = prepareClaudeRequest(result, provider, preserveCache);
   }
 
   // Normalize openai-responses input shape for providers that require list input.
@@ -171,9 +186,40 @@ export function translateRequest(
     );
   }
 
+  if (result.tools !== undefined) {
+    result.tools = coerceToolSchemas(result.tools);
+    result.tools = sanitizeToolDescriptions(result.tools);
+  }
+
+  if (targetFormat === FORMATS.OPENAI && result.messages && Array.isArray(result.messages)) {
+    result.messages = injectEmptyReasoningContentForToolCalls(result.messages, provider);
+  }
+
   // Ensure unique tool_call ids on final payload (translators may have introduced duplicates)
   ensureToolCallIds(result, { use9CharId });
   fixMissingToolResponses(result);
+
+  if (result.tools) {
+    result.tools = coerceToolSchemas(result.tools);
+    result.tools = sanitizeToolDescriptions(result.tools);
+  }
+
+  // Inject reasoning_content = "" for DeepSeek/Reasoning models assistant messages with tool_calls
+  // if omitted by the client, to avoid upstream 400 errors (e.g. "Messages with role 'assistant' that contain tool_calls must also include reasoning_content")
+  const isReasoner =
+    provider === "deepseek" || (typeof model === "string" && /r1|reason/i.test(model));
+  if (isReasoner && result.messages && Array.isArray(result.messages)) {
+    for (const msg of result.messages) {
+      if (
+        msg.role === "assistant" &&
+        Array.isArray(msg.tool_calls) &&
+        msg.tool_calls.length > 0 &&
+        msg.reasoning_content === undefined
+      ) {
+        msg.reasoning_content = "";
+      }
+    }
+  }
 
   return result;
 }
@@ -221,6 +267,15 @@ export function translateResponse(targetFormat, sourceFormat, chunk, state) {
       const finalResults = [];
       for (const r of results) {
         const converted = fromOpenAI(r, state);
+        if (converted) {
+          finalResults.push(...(Array.isArray(converted) ? converted : [converted]));
+        }
+      }
+      // Flush: pass null to source-format translator even when Step 1 produced no output.
+      // This is critical for formats like openai-responses that emit terminal events
+      // (e.g., response.completed with total_tokens) in their flush handler.
+      if (chunk === null && results.length === 0) {
+        const converted = fromOpenAI(null, state);
         if (converted) {
           finalResults.push(...(Array.isArray(converted) ? converted : [converted]));
         }

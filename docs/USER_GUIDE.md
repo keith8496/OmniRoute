@@ -39,11 +39,11 @@ Complete guide for configuring providers, creating combos, integrating CLI tools
 | **💰 CHEAP**        | GLM-4.7           | $0.6/1M     | Daily 10AM       | Budget backup        |
 |                     | MiniMax M2.1      | $0.2/1M     | 5-hour rolling   | Cheapest option      |
 |                     | Kimi K2           | $9/mo flat  | 10M tokens/mo    | Predictable cost     |
-| **🆓 FREE**         | iFlow             | $0          | Unlimited        | 8 models free        |
+| **🆓 FREE**         | Qoder             | $0          | Unlimited        | 8 models free        |
 |                     | Qwen              | $0          | Unlimited        | 3 models free        |
 |                     | Kiro              | $0          | Unlimited        | Claude free          |
 
-**💡 Pro Tip:** Start with Gemini CLI (180K free/month) + iFlow (unlimited free) combo = $0 cost!
+**💡 Pro Tip:** Start with Gemini CLI (180K free/month) + Qoder (unlimited free) combo = $0 cost!
 
 ---
 
@@ -164,7 +164,7 @@ Dashboard → Providers → Connect GitHub
 Models:
   gh/gpt-5
   gh/claude-4.5-sonnet
-  gh/gemini-3-pro
+  gh/gemini-3.1-pro-preview
 ```
 
 ### 💰 Cheap Providers
@@ -193,10 +193,10 @@ Models:
 
 ### 🆓 FREE Providers
 
-#### iFlow (8 FREE models)
+#### Qoder (8 FREE models)
 
 ```bash
-Dashboard → Connect iFlow → OAuth login → Unlimited usage
+Dashboard → Connect Qoder → OAuth login → Unlimited usage
 
 Models: if/kimi-k2-thinking, if/qwen3-coder-plus, if/glm-4.7, if/minimax-m2, if/deepseek-r1
 ```
@@ -405,25 +405,130 @@ docker run -d --name omniroute -p 20128:20128 --env-file ./.env -v omniroute-dat
 
 For host-integrated mode with CLI binaries, see the Docker section in the main docs.
 
+### Void Linux (xbps-src)
+
+Void Linux users can package and install OmniRoute natively using the `xbps-src` cross-compilation framework. This automates the Node.js standalone build along with the required `better-sqlite3` native bindings.
+
+<details>
+<summary><b>View xbps-src template</b></summary>
+
+```bash
+# Template file for 'omniroute'
+pkgname=omniroute
+version=3.2.4
+revision=1
+hostmakedepends="nodejs python3 make"
+depends="openssl"
+short_desc="Universal AI gateway with smart routing for multiple LLM providers"
+maintainer="zenobit <zenobit@disroot.org>"
+license="MIT"
+homepage="https://github.com/diegosouzapw/OmniRoute"
+distfiles="https://github.com/diegosouzapw/OmniRoute/archive/refs/tags/v${version}.tar.gz"
+checksum=009400afee90a9f32599d8fe734145cfd84098140b7287990183dde45ae2245b
+system_accounts="_omniroute"
+omniroute_homedir="/var/lib/omniroute"
+export NODE_ENV=production
+export npm_config_engine_strict=false
+export npm_config_loglevel=error
+export npm_config_fund=false
+export npm_config_audit=false
+
+do_build() {
+	# Determine target CPU arch for node-gyp
+	local _gyp_arch
+	case "$XBPS_TARGET_MACHINE" in
+		aarch64*) _gyp_arch=arm64 ;;
+		armv7*|armv6*) _gyp_arch=arm ;;
+		i686*) _gyp_arch=ia32 ;;
+		*) _gyp_arch=x64 ;;
+	esac
+
+	# 1) Install all deps – skip scripts
+	NODE_ENV=development npm ci --ignore-scripts
+
+	# 2) Build the Next.js standalone bundle
+	npm run build
+
+	# 3) Copy static assets into standalone
+	cp -r .next/static .next/standalone/.next/static
+	[ -d public ] && cp -r public .next/standalone/public || true
+
+	# 4) Compile better-sqlite3 native binding
+	local _node_gyp=/usr/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js
+	(cd node_modules/better-sqlite3 && node "$_node_gyp" rebuild --arch="$_gyp_arch")
+
+	# 5) Place the compiled binding into the standalone bundle
+	local _bs3_release=.next/standalone/node_modules/better-sqlite3/build/Release
+	mkdir -p "$_bs3_release"
+	cp node_modules/better-sqlite3/build/Release/better_sqlite3.node "$_bs3_release/"
+
+	# 6) Remove arch-specific sharp bundles
+	rm -rf .next/standalone/node_modules/@img
+
+	# 7) Copy pino runtime deps omitted by Next.js static analysis:
+	for _mod in pino-abstract-transport split2 process-warning; do
+		cp -r "node_modules/$_mod" .next/standalone/node_modules/
+	done
+}
+
+do_check() {
+	npm run test:unit
+}
+
+do_install() {
+	vmkdir usr/lib/omniroute/.next
+	vcopy .next/standalone/. usr/lib/omniroute/.next/standalone
+
+	# Prevent removal of empty Next.js app router dirs by the post-install hook
+	for _d in \
+		.next/standalone/.next/server/app/dashboard \
+		.next/standalone/.next/server/app/dashboard/settings \
+		.next/standalone/.next/server/app/dashboard/providers; do
+		touch "${DESTDIR}/usr/lib/omniroute/${_d}/.keep"
+	done
+
+	cat > "${WRKDIR}/omniroute" <<'EOF'
+#!/bin/sh
+export PORT="${PORT:-20128}"
+export DATA_DIR="${DATA_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/omniroute}"
+export LOG_TO_FILE="${LOG_TO_FILE:-false}"
+mkdir -p "${DATA_DIR}"
+exec node /usr/lib/omniroute/.next/standalone/server.js "$@"
+EOF
+	vbin "${WRKDIR}/omniroute"
+}
+
+post_install() {
+	vlicense LICENSE
+}
+```
+
+</details>
+
 ### Environment Variables
 
-| Variable                  | Default                              | Description                                             |
-| ------------------------- | ------------------------------------ | ------------------------------------------------------- |
-| `JWT_SECRET`              | `omniroute-default-secret-change-me` | JWT signing secret (**change in production**)           |
-| `INITIAL_PASSWORD`        | `123456`                             | First login password                                    |
-| `DATA_DIR`                | `~/.omniroute`                       | Data directory (db, usage, logs)                        |
-| `PORT`                    | framework default                    | Service port (`20128` in examples)                      |
-| `HOSTNAME`                | framework default                    | Bind host (Docker defaults to `0.0.0.0`)                |
-| `NODE_ENV`                | runtime default                      | Set `production` for deploy                             |
-| `BASE_URL`                | `http://localhost:20128`             | Server-side internal base URL                           |
-| `CLOUD_URL`               | `https://omniroute.dev`              | Cloud sync endpoint base URL                            |
-| `API_KEY_SECRET`          | `endpoint-proxy-api-key-secret`      | HMAC secret for generated API keys                      |
-| `REQUIRE_API_KEY`         | `false`                              | Enforce Bearer API key on `/v1/*`                       |
-| `ENABLE_REQUEST_LOGS`     | `false`                              | Enables request/response logs                           |
-| `AUTH_COOKIE_SECURE`      | `false`                              | Force `Secure` auth cookie (behind HTTPS reverse proxy) |
-| `OMNIROUTE_MEMORY_MB`     | `512`                                | Node.js heap limit in MB                                |
-| `PROMPT_CACHE_MAX_SIZE`   | `50`                                 | Max prompt cache entries                                |
-| `SEMANTIC_CACHE_MAX_SIZE` | `100`                                | Max semantic cache entries                              |
+| Variable                                | Default                              | Description                                                                                               |
+| --------------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| `JWT_SECRET`                            | `omniroute-default-secret-change-me` | JWT signing secret (**change in production**)                                                             |
+| `INITIAL_PASSWORD`                      | `123456`                             | First login password                                                                                      |
+| `DATA_DIR`                              | `~/.omniroute`                       | Data directory (db, usage, logs)                                                                          |
+| `PORT`                                  | framework default                    | Service port (`20128` in examples)                                                                        |
+| `HOSTNAME`                              | framework default                    | Bind host (Docker defaults to `0.0.0.0`)                                                                  |
+| `NODE_ENV`                              | runtime default                      | Set `production` for deploy                                                                               |
+| `BASE_URL`                              | `http://localhost:20128`             | Server-side internal base URL                                                                             |
+| `CLOUD_URL`                             | `https://omniroute.dev`              | Cloud sync endpoint base URL                                                                              |
+| `API_KEY_SECRET`                        | `endpoint-proxy-api-key-secret`      | HMAC secret for generated API keys                                                                        |
+| `REQUIRE_API_KEY`                       | `false`                              | Enforce Bearer API key on `/v1/*`                                                                         |
+| `ALLOW_API_KEY_REVEAL`                  | `false`                              | Allow Api Manager to copy full API keys on demand                                                         |
+| `PROVIDER_LIMITS_SYNC_INTERVAL_MINUTES` | `70`                                 | Server-side refresh cadence for cached Provider Limits data; UI refresh buttons still trigger manual sync |
+| `DISABLE_SQLITE_AUTO_BACKUP`            | `false`                              | Disable automatic SQLite snapshots before writes/import/restore; manual backups still work                |
+| `ENABLE_REQUEST_LOGS`                   | `false`                              | Enables request/response logs                                                                             |
+| `AUTH_COOKIE_SECURE`                    | `false`                              | Force `Secure` auth cookie (behind HTTPS reverse proxy)                                                   |
+| `CLOUDFLARED_BIN`                       | unset                                | Use an existing `cloudflared` binary instead of managed download                                          |
+| `CLOUDFLARED_PROTOCOL`                  | `http2`                              | Transport for managed Quick Tunnels (`http2`, `quic`, or `auto`)                                          |
+| `OMNIROUTE_MEMORY_MB`                   | `512`                                | Node.js heap limit in MB                                                                                  |
+| `PROMPT_CACHE_MAX_SIZE`                 | `50`                                 | Max prompt cache entries                                                                                  |
+| `SEMANTIC_CACHE_MAX_SIZE`               | `100`                                | Max semantic cache entries                                                                                |
 
 For the full environment variable reference, see the [README](../README.md).
 
@@ -446,7 +551,7 @@ For the full environment variable reference, see the [README](../README.md).
 
 **MiniMax (`minimax/`)** — $0.2/1M: `minimax/MiniMax-M2.1`
 
-**iFlow (`if/`)** — FREE: `if/kimi-k2-thinking`, `if/qwen3-coder-plus`, `if/deepseek-r1`
+**Qoder (`if/`)** — FREE: `if/kimi-k2-thinking`, `if/qwen3-coder-plus`, `if/deepseek-r1`
 
 **Qwen (`qw/`)** — FREE: `qw/qwen3-coder-plus`, `qw/qwen3-coder-flash`
 
@@ -494,6 +599,11 @@ curl -X POST http://localhost:20128/api/provider-models \
 
 Or use Dashboard: **Providers → [Provider] → Custom Models**.
 
+Notes:
+
+- OpenRouter and OpenAI/Anthropic-compatible providers are managed from **Available Models** only. Manual add, import, and auto-sync all land in the same available-model list, so there is no separate Custom Models section for those providers.
+- The **Custom Models** section is intended for providers that do not expose managed available-model imports.
+
 ### Dedicated Provider Routes
 
 Route requests directly to a specific provider with model validation:
@@ -537,6 +647,17 @@ Returns models grouped by provider with types (`chat`, `embedding`, `image`).
 - Sync providers, combos, and settings across devices
 - Automatic background sync with timeout + fail-fast
 - Prefer server-side `BASE_URL`/`CLOUD_URL` in production
+
+### Cloudflare Quick Tunnel
+
+- Available in **Dashboard → Endpoints** for Docker and other self-hosted deployments
+- Creates a temporary `https://*.trycloudflare.com` URL that forwards to your current OpenAI-compatible `/v1` endpoint
+- First enable installs `cloudflared` only when needed; later restarts reuse the same managed binary
+- Quick Tunnels are not auto-restored after an OmniRoute or container restart; re-enable them from the dashboard when needed
+- Tunnel URLs are ephemeral and change every time you stop/start the tunnel
+- Managed Quick Tunnels default to HTTP/2 transport to avoid noisy QUIC UDP buffer warnings in constrained containers
+- Set `CLOUDFLARED_PROTOCOL=quic` or `auto` if you want to override the managed transport choice
+- Set `CLOUDFLARED_BIN` if you prefer using a preinstalled `cloudflared` binary instead of the managed download
 
 ### LLM Gateway Intelligence (Phase 9)
 
@@ -653,11 +774,11 @@ OmniRoute implements provider-level resilience with four components:
 
 Manage database backups in **Dashboard → Settings → System & Storage**.
 
-| Action                   | Description                                                                                                                    |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| **Export Database**      | Downloads the current SQLite database as a `.sqlite` file                                                                      |
-| **Export All (.tar.gz)** | Downloads a full backup archive including: database, settings, combos, provider connections (no credentials), API key metadata |
-| **Import Database**      | Upload a `.sqlite` file to replace the current database. A pre-import backup is automatically created                          |
+| Action                   | Description                                                                                                                                    |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Export Database**      | Downloads the current SQLite database as a `.sqlite` file                                                                                      |
+| **Export All (.tar.gz)** | Downloads a full backup archive including: database, settings, combos, provider connections (no credentials), API key metadata                 |
+| **Import Database**      | Upload a `.sqlite` file to replace the current database. A pre-import backup is automatically created unless `DISABLE_SQLITE_AUTO_BACKUP=true` |
 
 ```bash
 # API: Export database
@@ -683,10 +804,11 @@ curl -X POST http://localhost:20128/api/db-backups/import \
 
 ### Settings Dashboard
 
-The settings page is organized into 5 tabs for easy navigation:
+The settings page is organized into 6 tabs for easy navigation:
 
 | Tab            | Contents                                                                                       |
 | -------------- | ---------------------------------------------------------------------------------------------- |
+| **General**    | System storage tools, appearance settings, theme controls, and per-item sidebar visibility     |
 | **Security**   | Login/Password settings, IP Access Control, API auth for `/models`, and Provider Blocking      |
 | **Routing**    | Global routing strategy (6 options), wildcard model aliases, fallback chains, combo defaults   |
 | **Resilience** | Provider profiles, editable rate limits, circuit breaker status, policies & locked identifiers |

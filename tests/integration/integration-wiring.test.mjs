@@ -59,6 +59,7 @@ describe("Pipeline Wiring — server-init.ts", () => {
 
 describe("Pipeline Wiring — sse chat handler", () => {
   const src = readProjectFile("src/sse/handlers/chat.ts");
+  const coreSrc = readProjectFile("open-sse/handlers/chatCore.ts");
 
   it("should import and use request sanitization", () => {
     assert.ok(src, "src/sse/handlers/chat.ts should exist");
@@ -81,8 +82,10 @@ describe("Pipeline Wiring — sse chat handler", () => {
     assert.match(src, /generateRequestId/);
   });
 
-  it("should import cost tracking integration", () => {
-    assert.match(src, /recordCost/);
+  it("should keep cost tracking integration in the chat pipeline", () => {
+    assert.ok(coreSrc, "open-sse/handlers/chatCore.ts should exist");
+    assert.match(coreSrc, /calculateCost/);
+    assert.match(coreSrc, /recordCost/);
   });
 });
 
@@ -253,11 +256,11 @@ describe("DashboardLayout Integration", () => {
   });
 });
 
-describe("Page Integration — usage page wiring", () => {
-  const src = readProjectFile("src/app/(dashboard)/dashboard/usage/page.tsx");
+describe("Page Integration — logs page wiring", () => {
+  const src = readProjectFile("src/app/(dashboard)/dashboard/logs/page.tsx");
 
-  it("should wire segmented usage tabs", () => {
-    assert.ok(src, "src/app/(dashboard)/dashboard/usage/page.tsx should exist");
+  it("should wire segmented log tabs", () => {
+    assert.ok(src, "src/app/(dashboard)/dashboard/logs/page.tsx should exist");
     assert.match(src, /SegmentedControl/);
     assert.match(src, /RequestLoggerV2/);
     assert.match(src, /ProxyLogger/);
@@ -267,9 +270,17 @@ describe("Page Integration — usage page wiring", () => {
 describe("Page Integration — settings page wiring", () => {
   const src = readProjectFile("src/app/(dashboard)/dashboard/settings/page.tsx");
 
-  it("should include resilience and cache cards in tabs", () => {
+  it("should include resilience tab in advanced settings", () => {
     assert.ok(src, "src/app/(dashboard)/dashboard/settings/page.tsx should exist");
     assert.match(src, /ResilienceTab/);
+  });
+});
+
+describe("Page Integration — cache page wiring", () => {
+  const src = readProjectFile("src/app/(dashboard)/dashboard/cache/page.tsx");
+
+  it("should include cache stats card for prompt cache metrics", () => {
+    assert.ok(src, "src/app/(dashboard)/dashboard/cache/page.tsx should exist");
     assert.match(src, /CacheStatsCard/);
   });
 });

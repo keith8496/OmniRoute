@@ -25,7 +25,7 @@ export async function getUsageForProvider(connection) {
       return await getCodexUsage(accessToken, providerSpecificData);
     case "qwen":
       return await getQwenUsage(accessToken, providerSpecificData);
-    case "iflow":
+    case "qoder":
       return await getIflowUsage(accessToken);
     case "kiro":
       return await getKiroUsage(accessToken);
@@ -157,13 +157,15 @@ async function getAntigravityUsage(accessToken) {
 }
 
 /**
- * Claude Usage
+ * Claude Usage (legacy fallback)
+ * Real Claude OAuth quota windows are fetched in @omniroute/open-sse/services/usage.ts.
  */
-async function getClaudeUsage(accessToken) {
+async function getClaudeUsage() {
   try {
-    // Claude OAuth doesn't expose usage API directly
-    // Could potentially check via inference endpoint
-    return { message: "Claude connected. Usage tracked per request." };
+    return {
+      message:
+        "Claude connected. Detailed quota windows are handled by the open-sse usage service.",
+    };
   } catch (error) {
     return { message: "Unable to fetch Claude usage." };
   }
@@ -207,14 +209,14 @@ async function getQwenUsage(accessToken, providerSpecificData) {
 }
 
 /**
- * iFlow Usage
+ * Qoder Usage
  */
 async function getIflowUsage(accessToken) {
   try {
-    // iFlow may have usage endpoint
-    return { message: "iFlow connected. Usage tracked per request." };
+    // Qoder may have usage endpoint
+    return { message: "Qoder connected. Usage tracked per request." };
   } catch (error) {
-    return { message: "Unable to fetch iFlow usage." };
+    return { message: "Unable to fetch Qoder usage." };
   }
 }
 

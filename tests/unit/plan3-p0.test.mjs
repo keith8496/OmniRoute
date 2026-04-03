@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { FORMATS } from "../../open-sse/translator/formats.ts";
 import { getModelInfoCore } from "../../open-sse/services/model.ts";
-import { detectFormat } from "../../open-sse/services/provider.ts";
+import { detectFormat, detectFormatFromEndpoint } from "../../open-sse/services/provider.ts";
 import { shouldUseNativeCodexPassthrough } from "../../open-sse/handlers/chatCore.ts";
 import { translateRequest } from "../../open-sse/translator/index.ts";
 import { GithubExecutor } from "../../open-sse/executors/github.ts";
@@ -77,6 +77,45 @@ test("CodexExecutor forces stream=true for upstream compatibility", () => {
     false
   );
   assert.equal(transformed.stream, true);
+});
+
+test("Claude native messages can be round-tripped through OpenAI into Claude OAuth format", () => {
+  const normalizeOptions = { normalizeToolCallId: false, preserveDeveloperRole: undefined };
+  const openaiBody = translateRequest(
+    FORMATS.CLAUDE,
+    FORMATS.OPENAI,
+    "claude-sonnet-4-6",
+    {
+      model: "claude-sonnet-4-6",
+      max_tokens: 32,
+      messages: [{ role: "user", content: "reply with OK only" }],
+    },
+    false,
+    null,
+    "claude",
+    null,
+    normalizeOptions
+  );
+  const translated = translateRequest(
+    FORMATS.OPENAI,
+    FORMATS.CLAUDE,
+    "claude-sonnet-4-6",
+    openaiBody,
+    false,
+    null,
+    "claude",
+    null,
+    normalizeOptions
+  );
+
+  assert.deepEqual(translated.messages, [
+    {
+      role: "user",
+      content: [{ type: "text", text: "reply with OK only" }],
+    },
+  ]);
+  assert.ok(Array.isArray(translated.system));
+  assert.equal(translated.system[0]?.text?.includes("You are Claude Code"), true);
 });
 
 test("CodexExecutor maps fast service tier to priority", () => {
@@ -200,7 +239,7 @@ test("CodexExecutor preserves native responses payloads for Codex passthrough", 
   assert.equal(transformed.stream, true);
   assert.equal(transformed.service_tier, "priority");
   assert.equal(transformed.instructions, "custom system prompt");
-  assert.equal(transformed.store, true);
+  assert.equal(transformed.store, false);
   assert.deepEqual(transformed.metadata, { source: "codex-client" });
   assert.equal(transformed.reasoning_effort, "high");
   assert.ok(!("_nativeCodexPassthrough" in transformed));
@@ -320,6 +359,32 @@ test("detectFormat identifies OpenAI Responses by max_output_tokens without inpu
   assert.equal(format, FORMATS.OPENAI_RESPONSES);
 });
 
+test("detectFormatFromEndpoint forces OpenAI for /v1/chat/completions", () => {
+  const format = detectFormatFromEndpoint(
+    {
+      model: "cc/claude-opus-4-6",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 16,
+      stream: false,
+    },
+    "/v1/chat/completions"
+  );
+  assert.equal(format, FORMATS.OPENAI);
+});
+
+test("detectFormatFromEndpoint forces Claude for /v1/messages", () => {
+  const format = detectFormatFromEndpoint(
+    {
+      model: "claude-opus-4-6",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 16,
+      stream: false,
+    },
+    "/v1/messages"
+  );
+  assert.equal(format, FORMATS.CLAUDE);
+});
+
 test("translateRequest normalizes openai-responses input string into list payload", () => {
   const translated = translateRequest(
     FORMATS.OPENAI_RESPONSES,
@@ -437,4 +502,30 @@ test("parseSSEToOpenAIResponse merges split tool call chunks by id without dupli
   assert.equal(parsed.choices[0].message.tool_calls[0].id, "call_abc");
   assert.equal(parsed.choices[0].message.tool_calls[0].function.name, "sum");
   assert.equal(parsed.choices[0].message.tool_calls[0].function.arguments, '{"a":1}');
+});
+
+test("parseSSEToOpenAIResponse normalizes delta.reasoning alias to reasoning_content", () => {
+  const rawSSE = [
+    `data: ${JSON.stringify({
+      id: "chatcmpl_2",
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: { reasoning: "Let me think..." } }],
+    })}`,
+    `data: ${JSON.stringify({
+      id: "chatcmpl_2",
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: { reasoning: " The answer is 4." } }],
+    })}`,
+    `data: ${JSON.stringify({
+      id: "chatcmpl_2",
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: { content: "2+2=4" }, finish_reason: "stop" }],
+    })}`,
+    "data: [DONE]",
+  ].join("\n");
+
+  const parsed = parseSSEToOpenAIResponse(rawSSE, "moonshotai/kimi-k2.5");
+  assert.ok(parsed);
+  assert.equal(parsed.choices[0].message.reasoning_content, "Let me think... The answer is 4.");
+  assert.equal(parsed.choices[0].message.content, "2+2=4");
 });

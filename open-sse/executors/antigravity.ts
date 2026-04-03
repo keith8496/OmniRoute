@@ -1,8 +1,11 @@
-import crypto from "crypto";
-import { BaseExecutor } from "./base.ts";
+import crypto, { randomUUID } from "crypto";
+import { BaseExecutor, mergeUpstreamExtraHeaders } from "./base.ts";
 import { PROVIDERS, OAUTH_ENDPOINTS, HTTP_STATUS } from "../config/constants.ts";
 
-const MAX_RETRY_AFTER_MS = 10000;
+const MAX_RETRY_AFTER_MS = 60_000;
+const LONG_RETRY_THRESHOLD_MS = 60_000;
+
+const BARE_PRO_IDS = new Set(["gemini-3.1-pro"]);
 
 /**
  * Strip provider prefixes (e.g. "antigravity/model" → "model").
@@ -10,7 +13,13 @@ const MAX_RETRY_AFTER_MS = 10000;
  */
 function cleanModelName(model: string): string {
   if (!model) return model;
-  return model.includes("/") ? model.split("/").pop()! : model;
+  let clean = model.includes("/") ? model.split("/").pop()! : model;
+  // Normalize bare Pro IDs to the Low tier (matching OpenClaw convention).
+  // The upstream API requires an explicit tier suffix; bare IDs cause errors.
+  if (BARE_PRO_IDS.has(clean)) {
+    clean = `${clean}-low`;
+  }
+  return clean;
 }
 
 export class AntigravityExecutor extends BaseExecutor {
@@ -21,8 +30,12 @@ export class AntigravityExecutor extends BaseExecutor {
   buildUrl(model, stream, urlIndex = 0) {
     const baseUrls = this.getBaseUrls();
     const baseUrl = baseUrls[urlIndex] || baseUrls[0];
-    const action = stream ? "streamGenerateContent?alt=sse" : "generateContent";
-    return `${baseUrl}/v1internal:${action}`;
+    // Always use streaming endpoint — the non-streaming `generateContent` causes
+    // upstream 400 errors for some models (e.g. gpt-oss-120b-medium) because the
+    // Cloud Code API internally converts to OpenAI format and injects
+    // stream_options without setting stream=true.  chatCore already handles
+    // SSE→JSON conversion for non-streaming client requests.
+    return `${baseUrl}/v1internal:streamGenerateContent?alt=sse`;
   }
 
   buildHeaders(credentials, stream = true) {
@@ -31,11 +44,14 @@ export class AntigravityExecutor extends BaseExecutor {
       Authorization: `Bearer ${credentials.accessToken}`,
       "User-Agent": this.config.headers?.["User-Agent"] || "antigravity/1.104.0 darwin/arm64",
       "X-OmniRoute-Source": "omniroute",
-      ...(stream && { Accept: "text/event-stream" }),
+      Accept: "text/event-stream",
     };
   }
 
   transformRequest(model, body, stream, credentials) {
+    // TODO: Consider removing project override like gemini-cli.ts — stored projectId
+    // can become stale for Cloud Code accounts, causing 403 "has not been used in project X".
+    // Antigravity accounts may have more stable project IDs, but the risk exists.
     const bodyProjectId = body?.project;
     const credentialsProjectId = credentials?.projectId;
     const allowBodyProjectOverride = process.env.OMNIROUTE_ALLOW_BODY_PROJECT_OVERRIDE === "1";
@@ -77,10 +93,12 @@ export class AntigravityExecutor extends BaseExecutor {
           role = "user";
         }
 
-        // Strip thought parts (no valid signature -> provider rejects).
-        // Also drop entries that become empty after filtering, which can trigger
-        // 400 invalid argument on Gemini 3 Flash through Antigravity.
-        const parts = c.parts?.filter((p) => !p.thought && !p.thoughtSignature) || [];
+        const hasFunctionCall = c.parts?.some((p) => p.functionCall) || false;
+
+        // Antigravity rejects synthetic thought text, but Gemini 3+ requires any
+        // returned thoughtSignature metadata to survive model tool-call turns.
+        const parts =
+          c.parts?.filter((p) => !p.thought && (hasFunctionCall || !p.thoughtSignature)) || [];
         return { ...c, role, parts };
       }) || [];
 
@@ -148,7 +166,7 @@ export class AntigravityExecutor extends BaseExecutor {
   }
 
   generateSessionId() {
-    return `-${Math.floor(Math.random() * 9_000_000_000_000_000_000)}`;
+    return `-${parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) % 9_000_000_000_000_000_000}`;
   }
 
   parseRetryHeaders(headers) {
@@ -187,7 +205,7 @@ export class AntigravityExecutor extends BaseExecutor {
   parseRetryFromErrorMessage(errorMessage) {
     if (!errorMessage || typeof errorMessage !== "string") return null;
 
-    const match = errorMessage.match(/reset after (\d+h)?(\d+m)?(\d+s)?/i);
+    const match = errorMessage.match(/reset (?:after|in) (\d+h)?(\d+m)?(\d+s)?/i);
     if (!match) return null;
 
     let totalMs = 0;
@@ -198,17 +216,129 @@ export class AntigravityExecutor extends BaseExecutor {
     return totalMs > 0 ? totalMs : null;
   }
 
-  async execute({ model, body, stream, credentials, signal, log }) {
+  /**
+   * Collect an SSE streaming response into a single non-streaming JSON response.
+   * Parses Gemini-format SSE chunks and assembles text content + usage into one
+   * OpenAI-format chat.completion payload.
+   */
+  collectStreamToResponse(response, model, url, headers, transformedBody, log?, signal?) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    const SSE_COLLECT_TIMEOUT_MS = 120_000;
+
+    const collect = async () => {
+      const chunks: string[] = [];
+      let timedOut = false;
+      const timeout = AbortSignal.timeout(SSE_COLLECT_TIMEOUT_MS);
+      try {
+        while (true) {
+          if (signal?.aborted) throw new Error("Request aborted during SSE collection");
+          const { done, value } = await Promise.race([
+            reader.read(),
+            new Promise<never>((_, reject) =>
+              timeout.addEventListener(
+                "abort",
+                () => reject(new Error("SSE collection timed out")),
+                { once: true }
+              )
+            ),
+          ]);
+          if (done) break;
+          chunks.push(decoder.decode(value, { stream: true }));
+        }
+      } catch (err) {
+        const msg = err?.message || String(err);
+        timedOut = msg.includes("timed out");
+        log?.warn?.("SSE_COLLECT", `Error collecting SSE stream: ${msg}`);
+        // Fall through — return whatever was collected so far
+      }
+      const rawSSE = chunks.join("");
+
+      // Parse Gemini SSE: each line is "data: {json}"
+      let textContent = "";
+      let finishReason = "stop";
+      let usage: Record<string, unknown> | null = null;
+      const lines = rawSSE.split("\n");
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(payload);
+          const candidate = parsed?.response?.candidates?.[0];
+          if (candidate?.content?.parts) {
+            for (const part of candidate.content.parts) {
+              if (typeof part.text === "string" && !part.thought && !part.thoughtSignature) {
+                textContent += part.text;
+              }
+            }
+          }
+          if (candidate?.finishReason) {
+            finishReason =
+              candidate.finishReason.toLowerCase() === "stop"
+                ? "stop"
+                : candidate.finishReason.toLowerCase();
+          }
+          if (parsed?.response?.usageMetadata) {
+            const um = parsed.response.usageMetadata;
+            usage = {
+              prompt_tokens: um.promptTokenCount || 0,
+              completion_tokens: um.candidatesTokenCount || 0,
+              total_tokens: um.totalTokenCount || 0,
+            };
+          }
+        } catch (e) {
+          log?.debug?.("SSE_PARSE", `Skipping malformed SSE line: ${payload.slice(0, 80)}`);
+        }
+      }
+
+      const result = {
+        id: `chatcmpl-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: textContent },
+            finish_reason: timedOut ? "length" : finishReason,
+          },
+        ],
+        ...(usage && { usage }),
+      };
+
+      const syntheticStatus = timedOut ? 504 : response.status;
+      const syntheticResponse = new Response(JSON.stringify(result), {
+        status: syntheticStatus,
+        statusText: timedOut ? "Gateway Timeout" : response.statusText,
+        headers: [["Content-Type", "application/json"]],
+      });
+
+      return { response: syntheticResponse, url, headers, transformedBody };
+    };
+
+    return collect();
+  }
+
+  async execute({ model, body, stream, credentials, signal, log, upstreamExtraHeaders }) {
     const fallbackCount = this.getFallbackCount();
     let lastError = null;
     let lastStatus = 0;
     const MAX_AUTO_RETRIES = 3;
     const retryAttemptsByUrl = {}; // Track retry attempts per URL
 
+    // Always stream upstream — buildUrl always returns the streaming endpoint.
+    // For non-streaming clients, we collect the SSE below and return a synthetic
+    // non-streaming Response so chatCore's non-streaming path stays unchanged.
+    const upstreamStream = true;
+
     for (let urlIndex = 0; urlIndex < fallbackCount; urlIndex++) {
-      const url = this.buildUrl(model, stream, urlIndex);
-      const headers = this.buildHeaders(credentials, stream);
-      const transformedBody = this.transformRequest(model, body, stream, credentials);
+      const url = this.buildUrl(model, upstreamStream, urlIndex);
+      const headers = this.buildHeaders(credentials, upstreamStream);
+      mergeUpstreamExtraHeaders(headers, upstreamExtraHeaders);
+      const transformedBody = await this.transformRequest(model, body, upstreamStream, credentials);
 
       // Initialize retry counter for this URL
       if (!retryAttemptsByUrl[urlIndex]) {
@@ -223,12 +353,15 @@ export class AntigravityExecutor extends BaseExecutor {
           signal,
         });
 
+        // Parse retry time for 429/503 responses
+        let retryMs = null;
+
         if (
           response.status === HTTP_STATUS.RATE_LIMITED ||
           response.status === HTTP_STATUS.SERVICE_UNAVAILABLE
         ) {
           // Try to get retry time from headers first
-          let retryMs = this.parseRetryHeaders(response.headers);
+          retryMs = this.parseRetryHeaders(response.headers);
 
           // If no retry time in headers, try to parse from error message body
           if (!retryMs) {
@@ -237,17 +370,41 @@ export class AntigravityExecutor extends BaseExecutor {
               const errorJson = JSON.parse(errorBody);
               const errorMessage = errorJson?.error?.message || errorJson?.message || "";
               retryMs = this.parseRetryFromErrorMessage(errorMessage);
+
+              if (!retryMs) {
+                // Dynamic quota interpretation logic for Free vs Pro accounts
+                const lowerMsg = errorMessage.toLowerCase();
+
+                if (
+                  lowerMsg.includes("free tier") ||
+                  lowerMsg.includes("exhausted your capacity") ||
+                  lowerMsg.includes("daily limit") ||
+                  lowerMsg.includes("quota exceeded")
+                ) {
+                  // Hard limit hit for Free accounts (or exhausting general capacity), fallback immediately.
+                  // Setting a massive retryMs forces an instant fallback.
+                  retryMs = 24 * 60 * 60 * 1000; // 24 hours
+                } else if (
+                  lowerMsg.includes("pro") ||
+                  lowerMsg.includes("per minute") ||
+                  lowerMsg.includes("rpm")
+                ) {
+                  // RPM limit for Pro counts, backoff up to 1 minute, then fallback
+                  retryMs = 60 * 1000; // 60s
+                }
+              }
             } catch (e) {
               // Ignore parse errors, will fall back to exponential backoff
             }
           }
 
-          if (retryMs && retryMs <= MAX_RETRY_AFTER_MS) {
+          if (retryMs && retryMs <= LONG_RETRY_THRESHOLD_MS) {
+            const effectiveRetryMs = Math.min(retryMs, MAX_RETRY_AFTER_MS);
             log?.debug?.(
               "RETRY",
-              `${response.status} with Retry-After: ${Math.ceil(retryMs / 1000)}s, waiting...`
+              `${response.status} with Retry-After: ${Math.ceil(effectiveRetryMs / 1000)}s, waiting...`
             );
-            await new Promise((resolve) => setTimeout(resolve, retryMs));
+            await new Promise((resolve) => setTimeout(resolve, effectiveRetryMs));
             urlIndex--;
             continue;
           }
@@ -288,6 +445,47 @@ export class AntigravityExecutor extends BaseExecutor {
           log?.debug?.("RETRY", `${response.status} on ${url}, trying fallback ${urlIndex + 1}`);
           lastStatus = response.status;
           continue;
+        }
+
+        // If we have a 429 with long retry time, embed it in response body
+        if (
+          response.status === HTTP_STATUS.RATE_LIMITED &&
+          retryMs &&
+          retryMs > LONG_RETRY_THRESHOLD_MS
+        ) {
+          try {
+            const respBody = await response.clone().text();
+            let obj;
+            try {
+              obj = JSON.parse(respBody);
+            } catch {
+              obj = {};
+            }
+            obj.retryAfterMs = retryMs;
+            const modifiedBody = JSON.stringify(obj);
+            const modifiedResponse = new Response(modifiedBody, {
+              status: response.status,
+              headers: response.headers,
+            });
+            return { response: modifiedResponse, url, headers, transformedBody };
+          } catch (err) {
+            log?.warn?.("RETRY", `Failed to embed retryAfterMs: ${err}`);
+            // Fall back to original response
+          }
+        }
+
+        // For non-streaming clients, collect the SSE stream and return a synthetic
+        // non-streaming Response so chatCore doesn't need to handle SSE conversion.
+        if (!stream) {
+          return this.collectStreamToResponse(
+            response,
+            model,
+            url,
+            headers,
+            transformedBody,
+            log,
+            signal
+          );
         }
 
         return { response, url, headers, transformedBody };

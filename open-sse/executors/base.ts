@@ -58,9 +58,24 @@ export type ExecuteInput = {
   signal?: AbortSignal | null;
   log?: ExecutorLog | null;
   extendedContext?: boolean;
+  /** Merged after auth + CLI fingerprint headers (values override same-named defaults). */
+  upstreamExtraHeaders?: Record<string, string> | null;
 };
 
-function mergeAbortSignals(primary: AbortSignal, secondary: AbortSignal): AbortSignal {
+/** Apply model-level extra upstream headers (e.g. Authentication, X-Custom-Auth). */
+export function mergeUpstreamExtraHeaders(
+  headers: Record<string, string>,
+  extra?: Record<string, string> | null
+): void {
+  if (!extra) return;
+  for (const [k, v] of Object.entries(extra)) {
+    if (typeof k === "string" && k.length > 0 && typeof v === "string") {
+      headers[k] = v;
+    }
+  }
+}
+
+export function mergeAbortSignals(primary: AbortSignal, secondary: AbortSignal): AbortSignal {
   const controller = new AbortController();
 
   const abortBoth = () => {
@@ -204,7 +219,16 @@ export class BaseExecutor {
     return { status: response.status, message: bodyText || `HTTP ${response.status}` };
   }
 
-  async execute({ model, body, stream, credentials, signal, log, extendedContext }: ExecuteInput) {
+  async execute({
+    model,
+    body,
+    stream,
+    credentials,
+    signal,
+    log,
+    extendedContext,
+    upstreamExtraHeaders,
+  }: ExecuteInput) {
     const fallbackCount = this.getFallbackCount();
     let lastError: unknown = null;
     let lastStatus = 0;
@@ -237,16 +261,15 @@ export class BaseExecutor {
         }
       }
 
-      const transformedBody = this.transformRequest(model, body, stream, credentials);
+      const transformedBody = await this.transformRequest(model, body, stream, credentials);
 
       try {
-        // For non-streaming requests, apply a fetch timeout to prevent stalled connections.
-        // Streaming requests skip the timeout — they use stream idle detection instead.
-        const timeoutSignal = !stream ? AbortSignal.timeout(FETCH_TIMEOUT_MS) : null;
-        const combinedSignal =
-          signal && timeoutSignal
-            ? mergeAbortSignals(signal, timeoutSignal)
-            : signal || timeoutSignal;
+        // Apply timeout to all requests. Non-streaming requests need this to prevent
+        // stalled connections. Streaming requests also need it for the initial fetch() call
+        // to prevent hanging on unresponsive providers (e.g. 300s TCP default timeout — #769).
+        // Stream idle detection (STREAM_IDLE_TIMEOUT_MS) handles stalls after data starts flowing.
+        const timeoutSignal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+        const combinedSignal = signal ? mergeAbortSignals(signal, timeoutSignal) : timeoutSignal;
 
         // Apply CLI fingerprint ordering if enabled for this provider
         let finalHeaders = headers;
@@ -257,6 +280,8 @@ export class BaseExecutor {
           finalHeaders = fingerprinted.headers;
           bodyString = fingerprinted.bodyString;
         }
+
+        mergeUpstreamExtraHeaders(finalHeaders, upstreamExtraHeaders);
 
         const fetchOptions: RequestInit = {
           method: "POST",
@@ -289,7 +314,7 @@ export class BaseExecutor {
           continue;
         }
 
-        return { response, url, headers, transformedBody };
+        return { response, url, headers: finalHeaders, transformedBody };
       } catch (error) {
         // Distinguish timeout errors from other abort errors
         const err = error instanceof Error ? error : new Error(String(error));

@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import {
   getProviderCredentials,
   markAccountUnavailable,
@@ -5,9 +6,12 @@ import {
   extractApiKey,
   isValidApiKey,
 } from "../services/auth";
-import { getModelInfo, getCombo } from "../services/model";
+import { getModelInfo, getComboForModel } from "../services/model";
 import { parseModel } from "@omniroute/open-sse/services/model.ts";
-import { detectFormat, getTargetFormat } from "@omniroute/open-sse/services/provider.ts";
+import {
+  detectFormatFromEndpoint,
+  getTargetFormat,
+} from "@omniroute/open-sse/services/provider.ts";
 import { handleChatCore } from "@omniroute/open-sse/handlers/chatCore.ts";
 import { errorResponse, unavailableResponse } from "@omniroute/open-sse/utils/error.ts";
 import { handleComboChat } from "@omniroute/open-sse/services/combo.ts";
@@ -39,9 +43,9 @@ import {
 import { markAccountExhaustedFrom429 } from "../../domain/quotaCache";
 import { RequestTelemetry, recordTelemetry } from "../../shared/utils/requestTelemetry";
 import { generateRequestId } from "../../shared/utils/requestId";
-import { recordCost } from "../../domain/costRules";
 import { logAuditEvent } from "../../lib/compliance/index";
 import { enforceApiKeyPolicy } from "../../shared/utils/apiKeyPolicy";
+import { cloneLogPayload } from "@/lib/logPayloads";
 import {
   applyTaskAwareRouting,
   getTaskRoutingConfig,
@@ -79,6 +83,13 @@ export async function handleChat(request: any, clientRawRequest: any = null) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid JSON body");
   }
 
+  const rawClientBody = cloneLogPayload(body);
+
+  // Build clientRawRequest for logging (if not provided)
+  if (!clientRawRequest) {
+    clientRawRequest = buildClientRawRequest(request, rawClientBody);
+  }
+
   // FASE-01: Input sanitization — prompt injection detection & PII redaction
   telemetry.startPhase("validate");
   const sanitizeResult = sanitizeRequest(body, log as any);
@@ -111,16 +122,6 @@ export async function handleChat(request: any, clientRawRequest: any = null) {
     );
   }
 
-  // Build clientRawRequest for logging (if not provided)
-  if (!clientRawRequest) {
-    const url = new URL(request.url);
-    clientRawRequest = {
-      endpoint: url.pathname,
-      body,
-      headers: Object.fromEntries(request.headers.entries()),
-    };
-  }
-
   // Log request endpoint and model
   const url = new URL(request.url);
   const modelStr = body.model;
@@ -144,8 +145,8 @@ export async function handleChat(request: any, clientRawRequest: any = null) {
   }
 
   // Optional strict API key mode for /v1 endpoints (require key on every request).
-  const isInternalTest = request.headers?.get?.("x-internal-test") === "combo-health-check";
-  if (process.env.REQUIRE_API_KEY === "true" && !isInternalTest) {
+  const isComboLiveTest = request.headers?.get?.("x-internal-test") === "combo-health-check";
+  if (process.env.REQUIRE_API_KEY === "true" && !isComboLiveTest) {
     if (!apiKey) {
       log.warn("AUTH", "Missing API key while REQUIRE_API_KEY=true");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
@@ -155,7 +156,7 @@ export async function handleChat(request: any, clientRawRequest: any = null) {
       log.warn("AUTH", "Invalid API key while REQUIRE_API_KEY=true");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
     }
-  } else if (apiKey && !isInternalTest) {
+  } else if (apiKey && !isComboLiveTest) {
     // Client sent a Bearer key — it must exist in DB (otherwise reject to avoid "key ignored" confusion).
     const valid = await isValidApiKey(apiKey);
     if (!valid) {
@@ -231,16 +232,18 @@ export async function handleChat(request: any, clientRawRequest: any = null) {
 
   // Check if model is a combo (has multiple models with fallback)
   telemetry.startPhase("resolve");
-  const combo = await getCombo(resolvedModelStr);
+  const combo = await getComboForModel(resolvedModelStr);
   if (combo) {
     log.info(
       "CHAT",
       `Combo "${modelStr}" [${combo.strategy || "priority"}] with ${combo.models.length} models`
     );
 
-    // Pre-check function: skip models where all accounts are in cooldown
-    // Uses modelAvailability module for TTL-based cooldowns
+    // Pre-check function used by combo routing. For explicit combo live tests,
+    // avoid pre-skipping so each model gets a real execution attempt.
     const checkModelAvailable = async (modelString: string) => {
+      if (isComboLiveTest) return true;
+
       // Use getModelInfo to properly resolve custom prefixes
       const modelInfo = await getModelInfo(modelString);
       const provider = modelInfo.provider;
@@ -273,14 +276,67 @@ export async function handleChat(request: any, clientRawRequest: any = null) {
       body,
       combo,
       handleSingleModel: (b: any, m: string) =>
-        handleSingleModelChat(b, m, clientRawRequest, request, combo.name, apiKeyInfo, telemetry, {
-          sessionId,
-        }),
+        handleSingleModelChat(
+          b,
+          m,
+          clientRawRequest,
+          request,
+          combo.name,
+          apiKeyInfo,
+          telemetry,
+          {
+            sessionId,
+            forceLiveComboTest: isComboLiveTest,
+          },
+          combo.strategy,
+          true
+        ),
       isModelAvailable: checkModelAvailable,
       log,
       settings,
       allCombos,
     });
+
+    // ── Global Fallback Provider (#689) ────────────────────────────────────
+    // If combo exhausted all models, try the global fallback before giving up.
+    if (
+      !response.ok &&
+      [502, 503].includes(response.status) &&
+      typeof (settings as any)?.globalFallbackModel === "string" &&
+      (settings as any).globalFallbackModel.trim()
+    ) {
+      const fallbackModel = (settings as any).globalFallbackModel.trim();
+      log.info(
+        "GLOBAL_FALLBACK",
+        `Combo "${combo.name}" exhausted — attempting global fallback: ${fallbackModel}`
+      );
+      try {
+        const fallbackResponse = await handleSingleModelChat(
+          body,
+          fallbackModel,
+          clientRawRequest,
+          request,
+          combo.name,
+          apiKeyInfo,
+          telemetry,
+          { sessionId, emergencyFallbackTried: true, forceLiveComboTest: isComboLiveTest },
+          combo.strategy,
+          true
+        );
+        if (fallbackResponse.ok) {
+          log.info("GLOBAL_FALLBACK", `Global fallback ${fallbackModel} succeeded`);
+          recordTelemetry(telemetry);
+          return withSessionHeader(fallbackResponse, sessionId);
+        }
+        log.warn(
+          "GLOBAL_FALLBACK",
+          `Global fallback ${fallbackModel} also failed (${fallbackResponse.status})`
+        );
+      } catch (err: any) {
+        log.warn("GLOBAL_FALLBACK", `Global fallback error: ${err?.message || "unknown"}`);
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Record telemetry
     recordTelemetry(telemetry);
@@ -297,10 +353,21 @@ export async function handleChat(request: any, clientRawRequest: any = null) {
     null,
     apiKeyInfo,
     telemetry,
-    { sessionId }
+    { sessionId, forceLiveComboTest: isComboLiveTest },
+    null,
+    false
   );
   recordTelemetry(telemetry);
   return withSessionHeader(response, sessionId);
+}
+
+export function buildClientRawRequest(request: Request, body: unknown) {
+  const url = new URL(request.url);
+  return {
+    endpoint: url.pathname,
+    body: cloneLogPayload(body),
+    headers: Object.fromEntries(request.headers.entries()),
+  };
 }
 
 /**
@@ -318,16 +385,26 @@ async function handleSingleModelChat(
   comboName: string | null = null,
   apiKeyInfo: any = null,
   telemetry: any = null,
-  runtimeOptions: { emergencyFallbackTried?: boolean; sessionId?: string | null } = {}
+  runtimeOptions: {
+    emergencyFallbackTried?: boolean;
+    forceLiveComboTest?: boolean;
+    sessionId?: string | null;
+  } = {},
+  comboStrategy: string | null = null,
+  isCombo: boolean = false
 ) {
   // 1. Resolve model → provider/model
-  const resolved = await resolveModelOrError(modelStr, body);
+  const resolved = await resolveModelOrError(modelStr, body, clientRawRequest?.endpoint);
   if (resolved.error) return resolved.error;
 
   const { provider, model, sourceFormat, targetFormat, extendedContext } = resolved;
+  const forceLiveComboTest = runtimeOptions.forceLiveComboTest === true;
 
   // 2. Pipeline gates (availability + circuit breaker)
-  const gate = checkPipelineGates(provider, model);
+  const gate = checkPipelineGates(provider, model, {
+    ignoreCircuitBreaker: forceLiveComboTest,
+    ignoreModelCooldown: forceLiveComboTest,
+  });
   if (gate) return gate;
 
   const breaker = getCircuitBreaker(provider, {
@@ -349,7 +426,13 @@ async function handleSingleModelChat(
       provider,
       excludeConnectionId,
       apiKeyInfo?.allowedConnections ?? null,
-      model
+      model,
+      forceLiveComboTest
+        ? {
+            allowSuppressedConnections: true,
+            bypassQuotaPolicy: true,
+          }
+        : undefined
     );
 
     if (!credentials || credentials.allRateLimited) {
@@ -383,6 +466,7 @@ async function handleSingleModelChat(
     // 4. Execute chat via core (with circuit breaker + optional TLS)
     if (telemetry) telemetry.startPhase("connect");
     const { result, tlsFingerprintUsed } = await executeChatWithBreaker({
+      bypassCircuitBreaker: forceLiveComboTest,
       breaker,
       body,
       provider,
@@ -395,6 +479,8 @@ async function handleSingleModelChat(
       apiKeyInfo,
       userAgent,
       comboName,
+      comboStrategy,
+      isCombo,
       extendedContext,
     });
     if (telemetry) telemetry.endPhase();
@@ -418,7 +504,6 @@ async function handleSingleModelChat(
 
     if (result.success) {
       clearModelUnavailability(provider, model);
-      recordCostIfNeeded(apiKeyInfo, result);
       if (telemetry) telemetry.startPhase("finalize");
       if (telemetry) telemetry.endPhase();
       return result.response;
@@ -457,7 +542,7 @@ async function handleSingleModelChat(
             `${currentModelStr} -> ${fallbackModelStr} | reason=${fallbackDecision.reason}`
           );
 
-          return handleSingleModelChat(
+          const fallbackResponse = await handleSingleModelChat(
             fallbackBody,
             fallbackModelStr,
             clientRawRequest,
@@ -465,14 +550,27 @@ async function handleSingleModelChat(
             comboName,
             apiKeyInfo,
             telemetry,
-            { ...runtimeOptions, emergencyFallbackTried: true }
+            { ...runtimeOptions, emergencyFallbackTried: true },
+            null, // no strategy for emergency fallback
+            Boolean(comboName) // isCombo if comboName exists
+          );
+
+          if (fallbackResponse.ok) {
+            return fallbackResponse;
+          }
+
+          log.warn(
+            "EMERGENCY_FALLBACK",
+            `Emergency fallback to ${fallbackModelStr} failed with status ${fallbackResponse.status}. Resuming original provider account fallback.`
           );
         }
       }
     }
 
     // 6. Mark account as quota-exhausted on 429 response
-    if (result.status === 429) {
+    // For per-model quota providers (Gemini), a 429 on one model doesn't mean
+    // the entire account is exhausted — skip connection-wide exhaustion marking.
+    if (result.status === 429 && provider !== "gemini") {
       markAccountExhaustedFrom429(credentials.connectionId, provider);
     }
 
@@ -502,7 +600,7 @@ async function handleSingleModelChat(
 /**
  * Resolve model string to provider/model info, or return an error response.
  */
-async function resolveModelOrError(modelStr: string, body: any) {
+async function resolveModelOrError(modelStr: string, body: any, endpointPath: string = "") {
   const modelInfo = await getModelInfo(modelStr);
   if (!modelInfo.provider) {
     if ((modelInfo as any).errorType === "ambiguous_model") {
@@ -521,7 +619,7 @@ async function resolveModelOrError(modelStr: string, body: any) {
   }
 
   const { provider, model, extendedContext } = modelInfo;
-  const sourceFormat = detectFormat(body);
+  const sourceFormat = detectFormatFromEndpoint(body, endpointPath);
   const providerAlias = PROVIDER_ID_TO_ALIAS[provider] || provider;
 
   // If the custom model specifies apiFormat="responses", override targetFormat
@@ -546,8 +644,15 @@ async function resolveModelOrError(modelStr: string, body: any) {
  * Check pipeline gates: model availability + circuit breaker state.
  * Returns an error Response if blocked, or null if OK to proceed.
  */
-function checkPipelineGates(provider: string, model: string) {
-  if (!isModelAvailable(provider, model)) {
+function checkPipelineGates(
+  provider: string,
+  model: string,
+  options: { ignoreCircuitBreaker?: boolean; ignoreModelCooldown?: boolean } = {}
+) {
+  const modelAvailable = isModelAvailable(provider, model);
+  if (!modelAvailable && options.ignoreModelCooldown) {
+    log.info("AVAILABILITY", `${provider}/${model} cooldown bypassed for combo live test`);
+  } else if (!modelAvailable) {
     log.warn("AVAILABILITY", `${provider}/${model} is in cooldown, rejecting request`);
     return (unavailableResponse as any)(
       HTTP_STATUS.SERVICE_UNAVAILABLE,
@@ -562,7 +667,9 @@ function checkPipelineGates(provider: string, model: string) {
     onStateChange: (name: string, from: string, to: string) =>
       log.info("CIRCUIT", `${name}: ${from} → ${to}`),
   });
-  if (!breaker.canExecute()) {
+  if (options.ignoreCircuitBreaker && !breaker.canExecute()) {
+    log.info("CIRCUIT", `Bypassing OPEN circuit breaker for combo live test: ${provider}`);
+  } else if (!breaker.canExecute()) {
     log.warn("CIRCUIT", `Circuit breaker OPEN for ${provider}, rejecting request`);
     return (unavailableResponse as any)(
       HTTP_STATUS.SERVICE_UNAVAILABLE,
@@ -580,6 +687,7 @@ function checkPipelineGates(provider: string, model: string) {
  * Execute chat core wrapped in circuit breaker + optional TLS tracking.
  */
 async function executeChatWithBreaker({
+  bypassCircuitBreaker,
   breaker,
   body,
   provider,
@@ -592,6 +700,8 @@ async function executeChatWithBreaker({
   apiKeyInfo,
   userAgent,
   comboName,
+  comboStrategy,
+  isCombo,
   extendedContext,
 }: any): Promise<{ result: any; tlsFingerprintUsed: boolean }> {
   let tlsFingerprintUsed = false;
@@ -609,6 +719,8 @@ async function executeChatWithBreaker({
           apiKeyInfo,
           userAgent,
           comboName,
+          comboStrategy,
+          isCombo,
           onCredentialsRefreshed: async (newCreds: any) => {
             await updateProviderCredentials(credentials.connectionId, {
               accessToken: newCreds.accessToken,
@@ -622,6 +734,16 @@ async function executeChatWithBreaker({
           },
         })
       );
+
+    if (bypassCircuitBreaker) {
+      if (!proxyInfo?.proxy && isTlsFingerprintActive()) {
+        const tracked = await runWithTlsTracking(chatFn);
+        return { result: tracked.result, tlsFingerprintUsed: tracked.tlsFingerprintUsed };
+      }
+
+      const result = await chatFn();
+      return { result, tlsFingerprintUsed: false };
+    }
 
     if (!proxyInfo?.proxy && isTlsFingerprintActive()) {
       const tracked = await breaker.execute(async () => runWithTlsTracking(chatFn));
@@ -665,18 +787,6 @@ async function executeChatWithBreaker({
 
     throw cbErr;
   }
-}
-
-/**
- * Record cost if API key has budget tracking enabled.
- */
-function recordCostIfNeeded(apiKeyInfo: any, result: any) {
-  if (!apiKeyInfo?.id) return;
-  try {
-    const usage = result.usage || {};
-    const estimatedCost = ((usage.prompt_tokens || 0) + (usage.completion_tokens || 0)) * 0.000001;
-    if (estimatedCost > 0) recordCost(apiKeyInfo.id, estimatedCost);
-  } catch {}
 }
 
 // ──── Extracted helpers (T-28) ────

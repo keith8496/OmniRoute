@@ -26,7 +26,10 @@ export default function SystemStorageTab() {
     driver: "sqlite",
     dbPath: "~/.omniroute/storage.sqlite",
     sizeBytes: 0,
-    retentionDays: 90,
+    retentionDays: {
+      app: 7,
+      call: 7,
+    },
     lastBackupAt: null,
   });
 
@@ -179,12 +182,15 @@ export default function SystemStorageTab() {
     setImportStatus({ type: "", message: "" });
     setConfirmImport(false);
     try {
-      const formData = new FormData();
-      formData.append("file", pendingImportFile);
-      const res = await fetch("/api/db-backups/import", {
-        method: "POST",
-        body: formData,
-      });
+      const arrayBuffer = await pendingImportFile.arrayBuffer();
+      const res = await fetch(
+        `/api/db-backups/import?filename=${encodeURIComponent(pendingImportFile.name)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: arrayBuffer,
+        }
+      );
       const data = await res.json();
       if (res.ok) {
         setImportStatus({
@@ -273,6 +279,26 @@ export default function SystemStorageTab() {
             {t("databaseSize")}
           </p>
           <p className="text-sm font-mono text-text-main">{formatBytes(storageHealth.sizeBytes)}</p>
+        </div>
+      </div>
+
+      <div className="p-3 rounded-lg bg-bg border border-border mb-4">
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div>
+            <p className="text-sm font-medium text-text-main">Log retention policy</p>
+            <p className="text-xs text-text-muted">
+              Request logs follow <code>CALL_LOG_RETENTION_DAYS</code>. Application and audit logs
+              follow <code>APP_LOG_RETENTION_DAYS</code>.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Badge variant="default" size="sm">
+              Call {storageHealth.retentionDays.call}d
+            </Badge>
+            <Badge variant="default" size="sm">
+              App {storageHealth.retentionDays.app}d
+            </Badge>
+          </div>
         </div>
       </div>
 

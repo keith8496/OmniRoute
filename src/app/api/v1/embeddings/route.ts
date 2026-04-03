@@ -14,7 +14,7 @@ import {
   type EmbeddingProviderNodeRow,
   type EmbeddingProvider,
 } from "@omniroute/open-sse/config/embeddingRegistry.ts";
-import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
+import { errorResponse, unavailableResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import * as log from "@/sse/utils/logger";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
@@ -125,11 +125,11 @@ export async function POST(request) {
         if (n.apiType !== "chat" && n.apiType !== "responses") return false;
         try {
           const hostname = new URL(n.baseUrl).hostname;
+          // Strictly matching 172.16.0.0/12 (Docker/local) and explicitly blocking ::1 per SSRF hardening
           return (
             hostname === "localhost" ||
             hostname === "127.0.0.1" ||
-            hostname === "::1" ||
-            hostname === "[::1]"
+            /^172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname)
           );
         } catch {
           return false;
@@ -207,6 +207,14 @@ export async function POST(request) {
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
         `No credentials for embedding provider: ${provider}`
+      );
+    }
+    if (credentials.allRateLimited) {
+      return unavailableResponse(
+        HTTP_STATUS.RATE_LIMITED,
+        `[${provider}] All accounts rate limited`,
+        credentials.retryAfter,
+        credentials.retryAfterHuman
       );
     }
   }

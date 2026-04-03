@@ -16,6 +16,8 @@ export interface RegistryModel {
   toolCalling?: boolean;
   targetFormat?: string;
   unsupportedParams?: readonly string[];
+  /** Maximum context window in tokens */
+  contextLength?: number;
 }
 
 // Reasoning models reject temperature, top_p, penalties, logprobs, n.
@@ -44,7 +46,7 @@ export interface RegistryOAuth {
 
 export interface RegistryEntry {
   id: string;
-  alias: string;
+  alias?: string;
   format: string;
   executor: string;
   baseUrl?: string;
@@ -65,6 +67,8 @@ export interface RegistryEntry {
   chatPath?: string;
   clientVersion?: string;
   passthroughModels?: boolean;
+  /** Default context window for all models in this provider (can be overridden per-model) */
+  defaultContextLength?: number;
 }
 
 interface LegacyProvider {
@@ -137,6 +141,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     urlSuffix: "?beta=true",
     authType: "oauth",
     authHeader: "x-api-key",
+    defaultContextLength: 200000,
     headers: {
       "Anthropic-Version": "2023-06-01",
       "Anthropic-Beta":
@@ -180,33 +185,21 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     },
     authType: "apikey",
     authHeader: "x-goog-api-key",
+    defaultContextLength: 1000000,
     oauth: {
       clientIdEnv: "GEMINI_OAUTH_CLIENT_ID",
       clientIdDefault: "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
       clientSecretEnv: "GEMINI_OAUTH_CLIENT_SECRET",
       clientSecretDefault: "",
     },
-    models: [
-      { id: "gemini-3.1-pro-high", name: "Gemini 3.1 Pro High" },
-      { id: "gemini-3.1-pro-low", name: "Gemini 3.1 Pro Low" },
-      { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro" },
-      { id: "gemini-3-1-pro", name: "Gemini 3.1 Pro (Alt ID)" },
-      { id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro Preview" },
-      { id: "gemini-3.1-flash-lite-preview", name: "Gemini 3.1 Flash Lite Preview" },
-      { id: "gemini-3-flash-preview", name: "Gemini 3 Flash Preview" },
-      { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
-      { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
-      { id: "gemini-2.5-flash-lite", name: "Gemini 2.5 Flash Lite" },
-      { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash" },
-      { id: "gemini-2.0-flash-exp", name: "Gemini 2.0 Flash Exp" },
-      { id: "gemini-1.5-pro", name: "Gemini 1.5 Pro" },
-      { id: "gemini-1.5-flash", name: "Gemini 1.5 Flash" },
-    ],
+    models: [],
+    // Models are populated from Google's API via sync-models (per API key).
+    // No hardcoded fallback — show nothing until a key is added.
   },
 
   "gemini-cli": {
     id: "gemini-cli",
-    alias: "gc",
+    alias: "gemini-cli",
     format: "gemini-cli",
     executor: "gemini-cli",
     baseUrl: "https://cloudcode-pa.googleapis.com/v1internal",
@@ -216,26 +209,22 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     },
     authType: "oauth",
     authHeader: "bearer",
+    defaultContextLength: 1000000,
     oauth: {
       clientIdEnv: "GEMINI_CLI_OAUTH_CLIENT_ID",
       clientIdDefault: "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
-      clientSecretEnv: "GEMINI_CLI_OAUTH_CLIENT_SECRET",
+      clientSecretEnv: "GEMINI_OAUTH_CLIENT_SECRET",
       clientSecretDefault: "",
     },
     models: [
-      { id: "gemini-3.1-pro-high", name: "Gemini 3.1 Pro High" },
-      { id: "gemini-3.1-pro-low", name: "Gemini 3.1 Pro Low" },
-      { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro" },
-      { id: "gemini-3-1-pro", name: "Gemini 3.1 Pro (Alt ID)" },
+      { id: "gemini-3-pro-preview", name: "Gemini 3 Pro Preview" },
       { id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro Preview" },
-      { id: "gemini-3.1-flash-lite-preview", name: "Gemini 3.1 Flash Lite Preview" },
+      { id: "gemini-3.1-pro-preview-customtools", name: "Gemini 3.1 Pro Preview Custom Tools" },
       { id: "gemini-3-flash-preview", name: "Gemini 3 Flash Preview" },
+      { id: "gemini-3.1-flash-lite-preview", name: "Gemini 3.1 Flash Lite Preview" },
       { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
       { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
       { id: "gemini-2.5-flash-lite", name: "Gemini 2.5 Flash Lite" },
-      { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash" },
-      { id: "gemini-1.5-pro", name: "Gemini 1.5 Pro" },
-      { id: "gemini-1.5-flash", name: "Gemini 1.5 Flash" },
     ],
   },
 
@@ -247,6 +236,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     baseUrl: "https://chatgpt.com/backend-api/codex/responses",
     authType: "oauth",
     authHeader: "bearer",
+    defaultContextLength: 400000,
     headers: {
       Version: "0.92.0",
       "Openai-Beta": "responses=experimental",
@@ -261,6 +251,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     },
     models: [
       { id: "gpt-5.4", name: "GPT 5.4" },
+      { id: "gpt-5.4-mini", name: "GPT 5.4 Mini" },
       { id: "gpt-5.3-codex", name: "GPT 5.3 Codex" },
       { id: "gpt-5.3-codex-xhigh", name: "GPT 5.3 Codex (xHigh)" },
       { id: "gpt-5.3-codex-high", name: "GPT 5.3 Codex (High)" },
@@ -283,7 +274,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     alias: "qw",
     format: "openai",
     executor: "default",
-    baseUrl: "https://portal.qwen.ai/v1/chat/completions",
+    baseUrl: "https://chat.qwen.ai/api/v1/services/aigc/text-generation/generation",
     authType: "oauth",
     authHeader: "bearer",
     headers: {
@@ -316,27 +307,25 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     ],
   },
 
-  iflow: {
-    id: "iflow",
+  qoder: {
+    id: "qoder",
     alias: "if",
     format: "openai",
-    executor: "iflow",
-    baseUrl: "https://apis.iflow.cn/v1/chat/completions",
-    authType: "oauth",
+    executor: "qoder",
+    baseUrl: "https://api.qoder.com/v1/chat/completions",
+    authType: "apikey",
     authHeader: "bearer",
     headers: {
-      "User-Agent": "iFlow-Cli",
+      "User-Agent": "Qoder-Cli",
     },
     oauth: {
-      clientIdEnv: "IFLOW_OAUTH_CLIENT_ID",
-      clientIdDefault: "10009311001",
-      clientSecretEnv: "IFLOW_OAUTH_CLIENT_SECRET",
-      clientSecretDefault: "",
-      tokenUrl: "https://iflow.cn/oauth/token",
-      authUrl: "https://iflow.cn/oauth",
+      clientIdEnv: "QODER_OAUTH_CLIENT_ID",
+      clientSecretEnv: "QODER_OAUTH_CLIENT_SECRET",
+      tokenUrl: process.env.QODER_OAUTH_TOKEN_URL || "",
+      authUrl: process.env.QODER_OAUTH_AUTHORIZE_URL || "",
     },
     models: [
-      { id: "iflow-rome-30ba3b", name: "iFlow ROME" },
+      { id: "qoder-rome-30ba3b", name: "Qoder ROME" },
       { id: "qwen3-coder-plus", name: "Qwen3 Coder Plus" },
       { id: "qwen3-max", name: "Qwen3 Max" },
       { id: "qwen3-vl-plus", name: "Qwen3 Vision Plus" },
@@ -355,7 +344,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
 
   antigravity: {
     id: "antigravity",
-    alias: "ag",
+    alias: undefined,
     format: "antigravity",
     executor: "antigravity",
     baseUrls: [
@@ -378,16 +367,18 @@ export const REGISTRY: Record<string, RegistryEntry> = {
       clientIdEnv: "ANTIGRAVITY_OAUTH_CLIENT_ID",
       clientIdDefault: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
       clientSecretEnv: "ANTIGRAVITY_OAUTH_CLIENT_SECRET",
-      clientSecretDefault: "",
+      clientSecretDefault: "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",
     },
     models: [
       { id: "claude-opus-4-6-thinking", name: "Claude Opus 4.6 Thinking" },
       { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-      { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
-      { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
-      { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash" },
+      { id: "gemini-3-flash", name: "Gemini 3 Flash" },
+      { id: "gemini-3.1-flash-image", name: "Gemini 3.1 Flash Image" },
+      { id: "gemini-3.1-pro-high", name: "Gemini 3.1 Pro (High)" },
+      { id: "gemini-3.1-pro-low", name: "Gemini 3.1 Pro (Low)" },
       { id: "gpt-oss-120b-medium", name: "GPT OSS 120B Medium" },
     ],
+    passthroughModels: true,
   },
 
   github: {
@@ -399,6 +390,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     responsesBaseUrl: "https://api.githubcopilot.com/responses",
     authType: "oauth",
     authHeader: "bearer",
+    defaultContextLength: 128000,
     headers: {
       "copilot-integration-id": "vscode-chat",
       "editor-version": "vscode/1.110.0",
@@ -432,6 +424,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
       { id: "claude-opus-4-5-20251101", name: "Claude Opus 4.5 (Full ID)" },
       { id: "claude-sonnet-4", name: "Claude Sonnet 4" },
       { id: "claude-sonnet-4.5", name: "Claude Sonnet 4.5" },
+      { id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro Preview" },
       { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
       { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
       { id: "grok-code-fast-1", name: "Grok Code Fast 1" },
@@ -447,6 +440,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     baseUrl: "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
     authType: "oauth",
     authHeader: "bearer",
+    defaultContextLength: 200000,
     headers: {
       "Content-Type": "application/json",
       Accept: "application/vnd.amazon.eventstream",
@@ -473,6 +467,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     chatPath: "/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
     authType: "oauth",
     authHeader: "bearer",
+    defaultContextLength: 200000,
     headers: {
       "connect-accept-encoding": "gzip",
       "connect-protocol-version": "1",
@@ -482,6 +477,12 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     clientVersion: "1.1.3",
     models: [
       { id: "default", name: "Auto (Server Picks)" },
+      { id: "claude-4.6-opus-high-thinking", name: "Claude 4.6 Opus High Thinking" },
+      { id: "claude-4.6-opus-high", name: "Claude 4.6 Opus High" },
+      { id: "claude-4.6-sonnet-high-thinking", name: "Claude 4.6 Sonnet High Thinking" },
+      { id: "claude-4.6-sonnet-high", name: "Claude 4.6 Sonnet High" },
+      { id: "claude-4.6-haiku", name: "Claude 4.6 Haiku" },
+      { id: "claude-4.6-opus", name: "Claude 4.6 Opus" },
       { id: "claude-4.5-opus-high-thinking", name: "Claude 4.5 Opus High Thinking" },
       { id: "claude-4.5-opus-high", name: "Claude 4.5 Opus High" },
       { id: "claude-4.5-sonnet-thinking", name: "Claude 4.5 Sonnet Thinking" },
@@ -501,6 +502,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     baseUrl: "https://api.openai.com/v1/chat/completions",
     authType: "apikey",
     authHeader: "bearer",
+    defaultContextLength: 128000,
     models: [
       { id: "gpt-4o", name: "GPT-4o" },
       { id: "gpt-4o-mini", name: "GPT-4o Mini" },
@@ -522,6 +524,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     urlSuffix: "?beta=true",
     authType: "apikey",
     authHeader: "x-api-key",
+    defaultContextLength: 200000,
     headers: {
       "Anthropic-Version": "2023-06-01",
     },
@@ -548,6 +551,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     authType: "apikey",
     authHeader: "Authorization",
     authPrefix: "Bearer",
+    defaultContextLength: 200000,
     models: [
       { id: "glm-5", name: "GLM-5" },
       { id: "kimi-k2.5", name: "Kimi K2.5" },
@@ -562,13 +566,19 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     format: "openai",
     executor: "opencode",
     baseUrl: "https://opencode.ai/zen/v1",
+    modelsUrl: "https://opencode.ai/zen/v1/models",
     authType: "apikey",
     authHeader: "Authorization",
     authPrefix: "Bearer",
+    defaultContextLength: 200000,
     models: [
-      { id: "minimax-m2.5-free", name: "MiniMax M2.5 Free" },
-      { id: "big-pickle", name: "Big Pickle" },
-      { id: "gpt-5-nano", name: "GPT 5 Nano" },
+      { id: "minimax-m2.5-free", name: "MiniMax M2.5 Free", contextLength: 204800 },
+      { id: "big-pickle", name: "Big Pickle", contextLength: 200000 },
+      { id: "gpt-5-nano", name: "GPT 5 Nano", contextLength: 400000 },
+      { id: "mimo-v2-omni-free", name: "MiMo V2 Omni Free", contextLength: 262144 },
+      { id: "mimo-v2-pro-free", name: "MiMo V2 Pro Free", contextLength: 1048576 },
+      { id: "nemotron-3-super-free", name: "Nemotron 3 Super Free", contextLength: 1000000 },
+      { id: "qwen3.6-plus-free", name: "Qwen 3.6 Plus Free", contextLength: 1048576 },
     ],
   },
 
@@ -580,6 +590,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     baseUrl: "https://openrouter.ai/api/v1/chat/completions",
     authType: "apikey",
     authHeader: "bearer",
+    defaultContextLength: 128000,
     headers: {
       "HTTP-Referer": "https://endpoint-proxy.local",
       "X-Title": "Endpoint Proxy",
@@ -593,6 +604,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     format: "claude",
     executor: "default",
     baseUrl: "https://api.z.ai/api/anthropic/v1/messages",
+    defaultContextLength: 200000,
     urlSuffix: "?beta=true",
     authType: "apikey",
     authHeader: "x-api-key",
@@ -601,16 +613,16 @@ export const REGISTRY: Record<string, RegistryEntry> = {
       "Anthropic-Beta": "claude-code-20250219,interleaved-thinking-2025-05-14",
     },
     models: [
+      { id: "glm-5.1", name: "GLM 5.1", contextLength: 204800 },
       { id: "glm-5", name: "GLM 5" },
       { id: "glm-5-turbo", name: "GLM 5 Turbo" },
       { id: "glm-4.7-flash", name: "GLM 4.7 Flash" },
       { id: "glm-4.7", name: "GLM 4.7" },
-      { id: "glm-4.6v", name: "GLM 4.6V (Vision)" },
+      { id: "glm-4.6v", name: "GLM 4.6V (Vision)", contextLength: 128000 },
       { id: "glm-4.6", name: "GLM 4.6" },
-      { id: "glm-4.5v", name: "GLM 4.5V (Vision)" },
-      { id: "glm-4.5", name: "GLM 4.5" },
-      { id: "glm-4.5-air", name: "GLM 4.5 Air" },
-      { id: "glm-4-32b", name: "GLM 4 32B" },
+      { id: "glm-4.5v", name: "GLM 4.5V (Vision)", contextLength: 16000 },
+      { id: "glm-4.5", name: "GLM 4.5", contextLength: 128000 },
+      { id: "glm-4.5-air", name: "GLM 4.5 Air", contextLength: 128000 },
     ],
   },
 
@@ -1018,8 +1030,8 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     alias: "ollamacloud",
     format: "openai",
     executor: "default",
-    baseUrl: "https://api.ollama.com/v1/chat/completions",
-    modelsUrl: "https://api.ollama.com/v1/models",
+    baseUrl: "https://ollama.com/v1/chat/completions",
+    modelsUrl: "https://ollama.com/api/tags",
     authType: "apikey",
     authHeader: "bearer",
     // Note: rate limits vary by plan (free = "Light usage", Pro = more, Max = 5x Pro).
@@ -1258,10 +1270,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     alias: "lc",
     format: "openai",
     executor: "default",
-    // (#536) Correct OpenAI-compatible base URL — was longcat.chat/api/v1/chat/completions
-    // which is the chat endpoint directly, not the base. Key validation and routing must
-    // use https://api.longcat.chat/openai which resolves /v1/models and /v1/chat/completions
-    baseUrl: "https://api.longcat.chat/openai",
+    baseUrl: "https://api.longcat.chat/openai/v1/chat/completions",
     authType: "apikey",
     authHeader: "Authorization",
     authPrefix: "Bearer",
@@ -1353,7 +1362,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
       { id: "qwen/qwen3-32b", name: "Qwen3 32B (Puter)" },
       { id: "qwen/qwen3-coder", name: "Qwen3 Coder 480B (Puter)" },
     ],
-    passthroughModels: true, // 500+ models available — users can type any Puter model ID
+    passthroughModels: true, // 500+ models available — users can type arbitrary Puter model IDs
   },
 
   "cloudflare-ai": {
@@ -1496,8 +1505,6 @@ export function generateAliasMap(): Record<string, string> {
 const LOCAL_HOSTNAMES = new Set([
   "localhost",
   "127.0.0.1",
-  "::1",
-  "[::1]",
   ...(typeof process !== "undefined" && process.env.LOCAL_HOSTNAMES
     ? process.env.LOCAL_HOSTNAMES.split(",")
         .map((h) => h.trim())
@@ -1516,10 +1523,32 @@ export function isLocalProvider(baseUrl?: string | null): boolean {
   if (!baseUrl) return false;
   try {
     const url = new URL(baseUrl);
-    return LOCAL_HOSTNAMES.has(url.hostname);
+    const hostname = url.hostname;
+    // Strictly matching 172.16.0.0/12 (Docker/local) and explicitly blocking ::1 per SSRF hardening
+    return (
+      LOCAL_HOSTNAMES.has(hostname) ||
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname)
+    );
   } catch {
     return false;
   }
+}
+
+/** Set of provider IDs with passthroughModels enabled — 404s are model-specific, not account-level. */
+const _passthroughProviderIds: Set<string> | null = (() => {
+  try {
+    const ids = new Set<string>();
+    for (const entry of Object.values(REGISTRY)) {
+      if (entry.passthroughModels) ids.add(entry.id);
+    }
+    return ids;
+  } catch {
+    return null;
+  }
+})();
+
+export function getPassthroughProviders(): Set<string> {
+  return _passthroughProviderIds ?? new Set<string>();
 }
 
 // ── Registry Lookup Helpers ───────────────────────────────────────────────

@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from "react";
+import { createPortal } from "react-dom";
 import { useNotificationStore } from "@/store/notificationStore";
 import PropTypes from "prop-types";
 import { useParams, useRouter } from "next/navigation";
@@ -28,20 +29,40 @@ import {
   getProviderAlias,
   isOpenAICompatibleProvider,
   isAnthropicCompatibleProvider,
+  isClaudeCodeCompatibleProvider,
+  supportsApiKeyOnFreeProvider,
 } from "@/shared/constants/providers";
 import { getModelsByProviderId } from "@/shared/constants/models";
+import {
+  compatibleProviderSupportsModelImport,
+  getCompatibleFallbackModels,
+} from "@/lib/providers/managedAvailableModels";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import {
   MODEL_COMPAT_PROTOCOL_KEYS,
   type ModelCompatProtocolKey,
 } from "@/shared/constants/modelCompat";
+import { resolveManagedModelAlias } from "@/shared/utils/providerModelAliases";
 
 type CompatByProtocolMap = Partial<
   Record<
     ModelCompatProtocolKey,
-    { normalizeToolCallId?: boolean; preserveOpenAIDeveloperRole?: boolean }
+    {
+      normalizeToolCallId?: boolean;
+      preserveOpenAIDeveloperRole?: boolean;
+      upstreamHeaders?: Record<string, string>;
+    }
   >
 >;
+
+/** PATCH fields for provider model compat (matches API + `ModelCompatPerProtocol` shape). */
+type ModelCompatSavePatch = {
+  normalizeToolCallId?: boolean;
+  preserveOpenAIDeveloperRole?: boolean;
+  upstreamHeaders?: Record<string, string>;
+  compatByProtocol?: CompatByProtocolMap;
+};
+
 type CompatModelRow = {
   id?: string;
   name?: string;
@@ -50,6 +71,7 @@ type CompatModelRow = {
   supportedEndpoints?: string[];
   normalizeToolCallId?: boolean;
   preserveOpenAIDeveloperRole?: boolean;
+  upstreamHeaders?: Record<string, string>;
   compatByProtocol?: CompatByProtocolMap;
 };
 
@@ -155,24 +177,115 @@ function anyNoPreserveCompatBadge(
   return false;
 }
 
+function upstreamHeadersRecordsEqual(
+  a: Record<string, string>,
+  b: Record<string, string>
+): boolean {
+  const ka = Object.keys(a).sort();
+  const kb = Object.keys(b).sort();
+  if (ka.length !== kb.length) return false;
+  return ka.every((k, i) => k === kb[i] && a[k] === b[k]);
+}
+
+type HeaderDraftRow = { id: string; name: string; value: string };
+
+const UPSTREAM_HEADERS_UI_MAX = 16;
+
+function recordToHeaderRows(rec: Record<string, string>, genId: () => string): HeaderDraftRow[] {
+  const entries = Object.entries(rec).filter(([k]) => k.trim());
+  if (entries.length === 0) return [{ id: genId(), name: "", value: "" }];
+  return entries.map(([name, value]) => ({ id: genId(), name, value }));
+}
+
+function headerRowsToRecord(rows: HeaderDraftRow[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const r of rows) {
+    const k = r.name.trim();
+    if (!k) continue;
+    out[k] = r.value;
+  }
+  return out;
+}
+
+type ProviderModelsApiErrorBody = {
+  error?: {
+    message?: string;
+    details?: Array<{ field?: string; message?: string }>;
+  };
+};
+
+async function formatProviderModelsErrorResponse(res: Response): Promise<string> {
+  try {
+    const data = (await res.json()) as ProviderModelsApiErrorBody;
+    const err = data?.error;
+    if (Array.isArray(err?.details) && err.details.length > 0) {
+      return err.details
+        .map((d) => {
+          const f = typeof d.field === "string" && d.field ? d.field : "?";
+          const m = typeof d.message === "string" ? d.message : "";
+          return m ? `${f}: ${m}` : f;
+        })
+        .join("; ");
+    }
+    if (typeof err?.message === "string" && err.message.trim()) {
+      return err.message.trim();
+    }
+  } catch {
+    /* ignore */
+  }
+  const st = res.statusText?.trim();
+  return st || `HTTP ${res.status}`;
+}
+
+function effectiveUpstreamHeadersForProtocol(
+  modelId: string,
+  protocol: string,
+  customMap: CompatModelMap,
+  overrideMap: CompatModelMap
+): Record<string, string> {
+  const c = customMap.get(modelId);
+  const o = overrideMap.get(modelId);
+  const base: Record<string, string> = {};
+  if (c?.upstreamHeaders && typeof c.upstreamHeaders === "object") {
+    Object.assign(base, c.upstreamHeaders);
+  } else if (o?.upstreamHeaders && typeof o.upstreamHeaders === "object") {
+    Object.assign(base, o.upstreamHeaders);
+  }
+  const pc = getProtoSlice(c, o, protocol);
+  if (pc?.upstreamHeaders && typeof pc.upstreamHeaders === "object") {
+    Object.assign(base, pc.upstreamHeaders);
+  }
+  return base;
+}
+
+function anyUpstreamHeadersBadge(
+  modelId: string,
+  customMap: CompatModelMap,
+  overrideMap: CompatModelMap
+): boolean {
+  const c = customMap.get(modelId);
+  const o = overrideMap.get(modelId);
+  const nonempty = (u: unknown) =>
+    u && typeof u === "object" && !Array.isArray(u) && Object.keys(u as object).length > 0;
+  if (nonempty(c?.upstreamHeaders) || nonempty(o?.upstreamHeaders)) return true;
+  for (const p of MODEL_COMPAT_PROTOCOL_KEYS) {
+    const pc = getProtoSlice(c, o, p);
+    if (nonempty(pc?.upstreamHeaders)) return true;
+  }
+  return false;
+}
+
 interface ModelRowProps {
   model: { id: string };
   fullModel: string;
-  alias?: string;
   copied?: string;
   onCopy: (text: string, key: string) => void;
   t: (key: string, values?: Record<string, unknown>) => string;
   showDeveloperToggle?: boolean;
   effectiveModelNormalize: (modelId: string, protocol?: string) => boolean;
   effectiveModelPreserveDeveloper: (modelId: string, protocol?: string) => boolean;
-  saveModelCompatFlags: (
-    modelId: string,
-    patch: {
-      normalizeToolCallId?: boolean;
-      preserveOpenAIDeveloperRole?: boolean;
-      compatByProtocol?: CompatByProtocolMap;
-    }
-  ) => void;
+  saveModelCompatFlags: (modelId: string, patch: ModelCompatSavePatch) => void;
+  getUpstreamHeadersRecord: (protocol: string) => Record<string, string>;
   compatDisabled?: boolean;
 }
 
@@ -186,14 +299,8 @@ interface PassthroughModelRowProps {
   showDeveloperToggle?: boolean;
   effectiveModelNormalize: (modelId: string, protocol?: string) => boolean;
   effectiveModelPreserveDeveloper: (modelId: string, protocol?: string) => boolean;
-  saveModelCompatFlags: (
-    modelId: string,
-    patch: {
-      normalizeToolCallId?: boolean;
-      preserveOpenAIDeveloperRole?: boolean;
-      compatByProtocol?: CompatByProtocolMap;
-    }
-  ) => void;
+  saveModelCompatFlags: (modelId: string, patch: ModelCompatSavePatch) => void;
+  getUpstreamHeadersRecord: (protocol: string) => Record<string, string>;
   compatDisabled?: boolean;
 }
 
@@ -207,6 +314,7 @@ interface PassthroughModelsSectionProps {
   t: (key: string, values?: Record<string, unknown>) => string;
   effectiveModelNormalize: (alias: string) => boolean;
   effectiveModelPreserveDeveloper: (alias: string) => boolean;
+  getUpstreamHeadersRecord: (modelId: string, protocol: string) => Record<string, string>;
   saveModelCompatFlags: (
     modelId: string,
     flags: {
@@ -230,6 +338,11 @@ interface CompatibleModelsSectionProps {
   providerStorageAlias: string;
   providerDisplayAlias: string;
   modelAliases: Record<string, string>;
+  fallbackModels?: CompatModelRow[];
+  allowImport: boolean;
+  description: string;
+  inputLabel: string;
+  inputPlaceholder: string;
   copied?: string;
   onCopy: (text: string, key: string) => void;
   onSetAlias: (modelId: string, alias: string, providerStorageAlias?: string) => Promise<void>;
@@ -243,6 +356,7 @@ interface CompatibleModelsSectionProps {
   t: (key: string, values?: Record<string, unknown>) => string;
   effectiveModelNormalize: (alias: string) => boolean;
   effectiveModelPreserveDeveloper: (alias: string) => boolean;
+  getUpstreamHeadersRecord: (modelId: string, protocol: string) => Record<string, string>;
   saveModelCompatFlags: (
     modelId: string,
     flags: {
@@ -301,6 +415,10 @@ interface ConnectionRowProps {
   proxyHost?: string;
   onRefreshToken?: () => void;
   isRefreshing?: boolean;
+  onApplyCodexAuthLocal?: () => void;
+  isApplyingCodexAuthLocal?: boolean;
+  onExportCodexAuthFile?: () => void;
+  isExportingCodexAuthFile?: boolean;
 }
 
 interface AddApiKeyModalProps {
@@ -309,6 +427,7 @@ interface AddApiKeyModalProps {
   providerName?: string;
   isCompatible?: boolean;
   isAnthropic?: boolean;
+  isCcCompatible?: boolean;
   onSave: (data: {
     name: string;
     apiKey: string;
@@ -352,7 +471,12 @@ interface EditCompatibleNodeModalProps {
   onSave: (data: unknown) => Promise<void>;
   onClose: () => void;
   isAnthropic?: boolean;
+  isCcCompatible?: boolean;
 }
+
+const CC_COMPATIBLE_LABEL = "CC Compatible";
+const CC_COMPATIBLE_DETAILS_TITLE = "CC Compatible Details";
+const CC_COMPATIBLE_DEFAULT_CHAT_PATH = "/v1/messages?beta=true";
 
 function normalizeCodexLimitPolicy(policy: unknown): { use5h: boolean; useWeekly: boolean } {
   const record =
@@ -376,6 +500,7 @@ function ModelCompatPopover({
   t,
   effectiveModelNormalize,
   effectiveModelPreserveDeveloper,
+  getUpstreamHeadersRecord,
   onCompatPatch,
   showDeveloperToggle = true,
   disabled,
@@ -383,11 +508,13 @@ function ModelCompatPopover({
   t: (key: string) => string;
   effectiveModelNormalize: (protocol: string) => boolean;
   effectiveModelPreserveDeveloper: (protocol: string) => boolean;
+  getUpstreamHeadersRecord: (protocol: string) => Record<string, string>;
   onCompatPatch: (
     protocol: string,
     payload: {
       normalizeToolCallId?: boolean;
       preserveOpenAIDeveloperRole?: boolean;
+      upstreamHeaders?: Record<string, string>;
     }
   ) => void;
   showDeveloperToggle?: boolean;
@@ -395,15 +522,85 @@ function ModelCompatPopover({
 }) {
   const [open, setOpen] = useState(false);
   const [protocol, setProtocol] = useState<string>(MODEL_COMPAT_PROTOCOL_KEYS[0]);
+  const [headerRows, setHeaderRows] = useState<HeaderDraftRow[]>([]);
+  const [valuePeekRowId, setValuePeekRowId] = useState<string | null>(null);
+  const [valueFocusRowId, setValueFocusRowId] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const [portalPanelRect, setPortalPanelRect] = useState<{
+    top: number;
+    left: number;
+    width: number;
+  } | null>(null);
+  const headerRowIdRef = useRef(0);
+  const headerRowsRef = useRef<HeaderDraftRow[]>([]);
+  headerRowsRef.current = headerRows;
+
+  const genHeaderRowId = () => {
+    headerRowIdRef.current += 1;
+    return `uh-${headerRowIdRef.current}`;
+  };
 
   const normalizeToolCallId = effectiveModelNormalize(protocol);
   const preserveDeveloperRole = effectiveModelPreserveDeveloper(protocol);
   const devToggle = showDeveloperToggle && protocol !== "claude";
 
-  // Click-outside: check both trigger and panel so that if the panel is ever rendered
-  // in a portal (outside this subtree), clicks inside the panel still do not close it.
+  const tryCommitHeaderRows = useCallback(
+    (rows: HeaderDraftRow[]) => {
+      const parsed = headerRowsToRecord(rows);
+      const current = getUpstreamHeadersRecord(protocol);
+      if (upstreamHeadersRecordsEqual(parsed, current)) return;
+      onCompatPatch(protocol, { upstreamHeaders: parsed });
+    },
+    [getUpstreamHeadersRecord, onCompatPatch, protocol]
+  );
+
+  const onHeaderFieldBlur = useCallback(() => {
+    queueMicrotask(() => tryCommitHeaderRows(headerRowsRef.current));
+  }, [tryCommitHeaderRows]);
+
+  useEffect(() => {
+    if (!open) return;
+    return () => {
+      tryCommitHeaderRows(headerRowsRef.current);
+    };
+  }, [open, tryCommitHeaderRows]);
+
+  useEffect(() => {
+    if (!open) return;
+    const rec = getUpstreamHeadersRecord(protocol);
+    setHeaderRows(recordToHeaderRows(rec, genHeaderRowId));
+    // Only re-load rows when opening or switching protocol — not when the parent passes a new
+    // inline callback every render (would wipe in-progress edits).
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see above
+  }, [open, protocol]);
+
+  useEffect(() => {
+    setValuePeekRowId(null);
+    setValueFocusRowId(null);
+  }, [open, protocol]);
+
+  const namedHeaderCount = headerRows.filter((r) => r.name.trim()).length;
+  const canAddHeaderRow = namedHeaderCount < UPSTREAM_HEADERS_UI_MAX;
+
+  const updateHeaderRow = (id: string, patch: Partial<Pick<HeaderDraftRow, "name" | "value">>) => {
+    setHeaderRows((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  };
+
+  const addHeaderRow = () => {
+    if (!canAddHeaderRow) return;
+    setHeaderRows((prev) => [...prev, { id: genHeaderRowId(), name: "", value: "" }]);
+  };
+
+  const removeHeaderRow = (id: string) => {
+    setHeaderRows((prev) => {
+      const next = prev.filter((r) => r.id !== id);
+      const normalized = next.length === 0 ? [{ id: genHeaderRowId(), name: "", value: "" }] : next;
+      queueMicrotask(() => tryCommitHeaderRows(normalized));
+      return normalized;
+    });
+  };
+
   useEffect(() => {
     if (!open) return;
     const onDocClick = (e: MouseEvent) => {
@@ -416,66 +613,189 @@ function ModelCompatPopover({
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [open]);
 
+  const updatePortalPanelRect = useCallback(() => {
+    if (!open || !ref.current) return;
+    const rect = ref.current.getBoundingClientRect();
+    const margin = 10;
+    const width = Math.min(window.innerWidth - 2 * margin, 24 * 16);
+    let left = rect.right - width;
+    left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
+    setPortalPanelRect({ top: rect.bottom + 8, left, width });
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setPortalPanelRect(null);
+      return;
+    }
+    updatePortalPanelRect();
+    window.addEventListener("resize", updatePortalPanelRect);
+    window.addEventListener("scroll", updatePortalPanelRect, true);
+    return () => {
+      window.removeEventListener("resize", updatePortalPanelRect);
+      window.removeEventListener("scroll", updatePortalPanelRect, true);
+    };
+  }, [open, updatePortalPanelRect]);
+
+  const panelChromeClass =
+    "flex max-h-[min(82vh,42rem)] flex-col overflow-hidden rounded-xl border-2 border-zinc-200 bg-white shadow-2xl dark:border-zinc-600 dark:bg-zinc-950";
+
   return (
-    <div className="relative inline-block" ref={ref}>
+    <div className="relative inline-flex" ref={ref}>
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
         disabled={disabled}
-        className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-border bg-sidebar/50 hover:bg-sidebar text-text-muted hover:text-text-main disabled:opacity-50"
+        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border border-border bg-background text-text-muted hover:bg-muted hover:text-text-main disabled:opacity-50 transition-colors"
         title={t("compatAdjustmentsTitle")}
       >
-        <span className="material-symbols-outlined text-sm">tune</span>
+        <span className="material-symbols-outlined text-base leading-none">tune</span>
         {t("compatButtonLabel")}
       </button>
-      {open && (
-        <div
-          ref={panelRef}
-          className="absolute left-0 top-full mt-1 z-50 min-w-[220px] max-w-[92vw] p-3 rounded-lg border border-border bg-white dark:bg-zinc-900 shadow-xl ring-1 ring-black/5 dark:ring-white/10"
-        >
-          <p className="text-[10px] font-semibold uppercase tracking-wide text-text-muted mb-1">
-            {t("compatAdjustmentsTitle")}
-          </p>
-          <p className="text-[10px] text-text-muted mb-2 leading-snug">{t("compatProtocolHint")}</p>
-          <label className="block text-[10px] font-medium text-text-muted mb-1">
-            {t("compatProtocolLabel")}
-          </label>
-          <select
-            value={protocol}
-            onChange={(e) => setProtocol(e.target.value)}
-            disabled={disabled}
-            className="w-full mb-3 px-2 py-1.5 text-xs rounded-md border border-border bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-primary/50"
+      {open &&
+        typeof document !== "undefined" &&
+        portalPanelRect &&
+        createPortal(
+          <div
+            ref={panelRef}
+            className={panelChromeClass}
+            style={{
+              position: "fixed",
+              top: portalPanelRect.top,
+              left: portalPanelRect.left,
+              width: portalPanelRect.width,
+              zIndex: 10040,
+            }}
           >
-            {MODEL_COMPAT_PROTOCOL_KEYS.map((p) => (
-              <option key={p} value={p}>
-                {t(compatProtocolLabelKey(p))}
-              </option>
-            ))}
-          </select>
-          <div className="flex flex-col gap-3">
-            <Toggle
-              size="sm"
-              label={t("compatToolIdShort")}
-              title={t("normalizeToolCallIdLabel")}
-              checked={normalizeToolCallId}
-              onChange={(v) => onCompatPatch(protocol, { normalizeToolCallId: v })}
-              disabled={disabled}
-            />
-            {devToggle && (
-              <Toggle
-                size="sm"
-                label={t("compatDoNotPreserveDeveloper")}
-                title={t("preserveDeveloperRoleLabel")}
-                checked={preserveDeveloperRole === false}
-                onChange={(checked) =>
-                  onCompatPatch(protocol, { preserveOpenAIDeveloperRole: !checked })
-                }
+            <div className="shrink-0 border-b-2 border-zinc-200 bg-zinc-100 px-3 py-2.5 dark:border-zinc-600 dark:bg-zinc-900">
+              <p className="text-xs font-semibold text-text-main">{t("compatAdjustmentsTitle")}</p>
+              <p className="text-[11px] text-text-muted mt-1 leading-relaxed">
+                {t("compatProtocolHint")}
+              </p>
+            </div>
+            <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto bg-white p-3 [scrollbar-gutter:stable] [scrollbar-width:thin] dark:bg-zinc-950">
+              <label className="block text-[11px] font-medium text-text-muted mb-1.5">
+                {t("compatProtocolLabel")}
+              </label>
+              <select
+                value={protocol}
+                onChange={(e) => setProtocol(e.target.value)}
                 disabled={disabled}
-              />
-            )}
-          </div>
-        </div>
-      )}
+                className="mb-4 w-full rounded-lg border border-zinc-200 bg-white px-2.5 py-2 text-xs text-text-main focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/30 dark:border-zinc-600 dark:bg-zinc-900"
+              >
+                {MODEL_COMPAT_PROTOCOL_KEYS.map((p) => (
+                  <option key={p} value={p}>
+                    {t(compatProtocolLabelKey(p))}
+                  </option>
+                ))}
+              </select>
+              <div className="flex flex-col gap-3.5">
+                <Toggle
+                  size="sm"
+                  label={t("compatToolIdShort")}
+                  title={t("normalizeToolCallIdLabel")}
+                  checked={normalizeToolCallId}
+                  onChange={(v) => onCompatPatch(protocol, { normalizeToolCallId: v })}
+                  disabled={disabled}
+                />
+                {devToggle && (
+                  <Toggle
+                    size="sm"
+                    label={t("compatDoNotPreserveDeveloper")}
+                    title={t("preserveDeveloperRoleLabel")}
+                    checked={preserveDeveloperRole === false}
+                    onChange={(checked) =>
+                      onCompatPatch(protocol, { preserveOpenAIDeveloperRole: !checked })
+                    }
+                    disabled={disabled}
+                  />
+                )}
+              </div>
+
+              <div className="mt-4 rounded-lg border-2 border-zinc-200 bg-zinc-100 p-3 dark:border-zinc-600 dark:bg-zinc-900">
+                <label className="block text-[11px] font-semibold text-text-main mb-1">
+                  {t("compatUpstreamHeadersLabel")}
+                </label>
+                <p className="text-[11px] text-text-muted mb-3 leading-relaxed">
+                  {t("compatUpstreamHeadersHint")}
+                </p>
+                <div className="space-y-2">
+                  <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-1.5 items-end text-[10px] font-medium uppercase tracking-wide text-text-muted px-0.5">
+                    <span>{t("compatUpstreamHeaderName")}</span>
+                    <span className="col-span-1">{t("compatUpstreamHeaderValue")}</span>
+                    <span className="w-8 shrink-0" aria-hidden />
+                  </div>
+                  {headerRows.map((row) => (
+                    <div
+                      key={row.id}
+                      className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-1.5 items-center"
+                    >
+                      <Input
+                        value={row.name}
+                        onChange={(e) => updateHeaderRow(row.id, { name: e.target.value })}
+                        onBlur={onHeaderFieldBlur}
+                        disabled={disabled}
+                        placeholder="Authentication"
+                        className="gap-0 min-w-0"
+                        inputClassName="h-9 bg-white py-1.5 px-2 text-xs font-mono dark:bg-zinc-900"
+                        autoComplete="off"
+                      />
+                      <div
+                        className="min-w-0"
+                        onMouseEnter={() => setValuePeekRowId(row.id)}
+                        onMouseLeave={() =>
+                          setValuePeekRowId((cur) => (cur === row.id ? null : cur))
+                        }
+                      >
+                        <Input
+                          type={
+                            valuePeekRowId === row.id || valueFocusRowId === row.id
+                              ? "text"
+                              : "password"
+                          }
+                          value={row.value}
+                          onChange={(e) => updateHeaderRow(row.id, { value: e.target.value })}
+                          onFocus={() => setValueFocusRowId(row.id)}
+                          onBlur={() => {
+                            setValueFocusRowId((cur) => (cur === row.id ? null : cur));
+                            onHeaderFieldBlur();
+                          }}
+                          disabled={disabled}
+                          placeholder="•••"
+                          className="gap-0 min-w-0"
+                          inputClassName="h-9 bg-white py-1.5 px-2 text-xs dark:bg-zinc-900"
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        disabled={disabled || headerRows.length <= 1}
+                        onClick={() => removeHeaderRow(row.id)}
+                        title={t("compatUpstreamRemoveRow")}
+                        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border/80 text-text-muted hover:bg-red-500/10 hover:text-red-600 dark:hover:text-red-400 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-text-muted transition-colors"
+                      >
+                        <span className="material-symbols-outlined text-lg leading-none">
+                          close
+                        </span>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  disabled={disabled || !canAddHeaderRow}
+                  onClick={addHeaderRow}
+                  className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-border py-2 text-xs font-medium text-primary hover:bg-primary/5 disabled:opacity-40 disabled:hover:bg-transparent transition-colors"
+                >
+                  <span className="material-symbols-outlined text-base leading-none">add</span>
+                  {t("compatUpstreamAddRow")}
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
     </div>
   );
 }
@@ -500,10 +820,11 @@ export default function ProviderDetailPage() {
   const { copied, copy } = useCopyToClipboard();
   const t = useTranslations("providers");
   const notify = useNotificationStore();
-  const hasAutoOpened = useRef(false);
-  const userDismissed = useRef(false);
   const [proxyTarget, setProxyTarget] = useState(null);
   const [proxyConfig, setProxyConfig] = useState(null);
+  const [connProxyMap, setConnProxyMap] = useState<
+    Record<string, { proxy: any; level: string } | null>
+  >({});
   const [importingModels, setImportingModels] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
   const [importProgress, setImportProgress] = useState({
@@ -519,18 +840,37 @@ export default function ProviderDetailPage() {
     customModels: CompatModelRow[];
     modelCompatOverrides: Array<CompatModelRow & { id: string }>;
   }>({ customModels: [], modelCompatOverrides: [] });
+  const [syncedAvailableModels, setSyncedAvailableModels] = useState<any[]>([]);
   const [compatSavingModelId, setCompatSavingModelId] = useState<string | null>(null);
+  const [applyingCodexAuthId, setApplyingCodexAuthId] = useState<string | null>(null);
+  const [exportingCodexAuthId, setExportingCodexAuthId] = useState<string | null>(null);
+  const isOpenAICompatible = isOpenAICompatibleProvider(providerId);
+  const isCcCompatible = isClaudeCodeCompatibleProvider(providerId);
+  const isAnthropicCompatible =
+    isAnthropicCompatibleProvider(providerId) && !isClaudeCodeCompatibleProvider(providerId);
+  const isCompatible = isOpenAICompatible || isAnthropicCompatible || isCcCompatible;
+  const isAnthropicProtocolCompatible = isAnthropicCompatible || isCcCompatible;
 
   const providerInfo = providerNode
     ? {
         id: providerNode.id,
         name:
           providerNode.name ||
-          (providerNode.type === "anthropic-compatible"
-            ? t("anthropicCompatibleName")
-            : t("openaiCompatibleName")),
-        color: providerNode.type === "anthropic-compatible" ? "#D97757" : "#10A37F",
-        textIcon: providerNode.type === "anthropic-compatible" ? "AC" : "OC",
+          (isCcCompatible
+            ? CC_COMPATIBLE_LABEL
+            : providerNode.type === "anthropic-compatible"
+              ? t("anthropicCompatibleName")
+              : t("openaiCompatibleName")),
+        color: isCcCompatible
+          ? "#B45309"
+          : providerNode.type === "anthropic-compatible"
+            ? "#D97757"
+            : "#10A37F",
+        textIcon: isCcCompatible
+          ? "CC"
+          : providerNode.type === "anthropic-compatible"
+            ? "AC"
+            : "OC",
         apiType: providerNode.apiType,
         baseUrl: providerNode.baseUrl,
         type: providerNode.type,
@@ -538,14 +878,17 @@ export default function ProviderDetailPage() {
     : (FREE_PROVIDERS as any)[providerId] ||
       (OAUTH_PROVIDERS as any)[providerId] ||
       (APIKEY_PROVIDERS as any)[providerId];
-  const isOAuth = !!(FREE_PROVIDERS as any)[providerId] || !!(OAUTH_PROVIDERS as any)[providerId];
-  const models = getModelsByProviderId(providerId);
+  const providerSupportsOAuth =
+    !!(FREE_PROVIDERS as any)[providerId] || !!(OAUTH_PROVIDERS as any)[providerId];
+  const providerSupportsPat = supportsApiKeyOnFreeProvider(providerId);
+  const isOAuth = providerSupportsOAuth && !providerSupportsPat;
+  const registryModels = getModelsByProviderId(providerId);
+  // For Gemini: always use synced API models (empty if no keys added yet)
+  const models = providerId === "gemini" ? syncedAvailableModels : registryModels;
   const providerAlias = getProviderAlias(providerId);
-
-  const isOpenAICompatible = isOpenAICompatibleProvider(providerId);
-  const isAnthropicCompatible = isAnthropicCompatibleProvider(providerId);
-  const isCompatible = isOpenAICompatible || isAnthropicCompatible;
+  const isManagedAvailableModelsProvider = isCompatible || providerId === "openrouter";
   const isSearchProvider = providerId.endsWith("-search");
+  const compatibleSupportsModelImport = compatibleProviderSupportsModelImport(providerId);
 
   const providerStorageAlias = isCompatible ? providerId : providerAlias;
   const providerDisplayAlias = isCompatible ? providerNode?.prefix || providerId : providerAlias;
@@ -575,6 +918,20 @@ export default function ProviderDetailPage() {
         customModels: data.models || [],
         modelCompatOverrides: data.modelCompatOverrides || [],
       });
+      // Fetch synced available models for Gemini
+      if (providerId === "gemini") {
+        try {
+          const syncRes = await fetch("/api/synced-available-models?provider=gemini", {
+            cache: "no-store",
+          });
+          if (syncRes.ok) {
+            const syncData = await syncRes.json();
+            setSyncedAvailableModels(syncData.models || []);
+          }
+        } catch {
+          // Non-critical
+        }
+      }
     } catch (e) {
       console.error("fetchProviderModelMeta", e);
     }
@@ -640,37 +997,47 @@ export default function ProviderDetailPage() {
   useEffect(() => {
     fetchConnections();
     fetchAliases();
-    // Load proxy config for visual indicators
+    // Load proxy config for visual indicators (provider-level button)
     fetch("/api/settings/proxy")
       .then((r) => (r.ok ? r.json() : null))
       .then((c) => setProxyConfig(c))
       .catch(() => {});
   }, [fetchConnections, fetchAliases]);
 
+  const loadConnProxies = useCallback(async (conns: { id?: string }[]) => {
+    if (!conns.length) return;
+    try {
+      const results = await Promise.all(
+        conns
+          .filter((c) => c.id)
+          .map((c) =>
+            fetch(`/api/settings/proxy?resolve=${encodeURIComponent(c.id!)}`, { cache: "no-store" })
+              .then((r) => (r.ok ? r.json() : null))
+              .then((data) => [c.id!, data] as [string, any])
+              .catch(() => [c.id!, null] as [string, any])
+          )
+      );
+      const map: Record<string, { proxy: any; level: string } | null> = {};
+      for (const [id, data] of results) {
+        map[id] = data?.proxy ? data : null;
+      }
+      setConnProxyMap(map);
+    } catch {
+      // ignore
+    }
+  }, []);
+
   useEffect(() => {
     if (loading || isSearchProvider) return;
     fetchProviderModelMeta();
   }, [loading, isSearchProvider, fetchProviderModelMeta]);
 
-  // Auto-open Add Connection modal when no connections exist (better UX)
-  // Only fires once on initial load, not on HMR remounts or after user dismissal
+  // Load per-connection effective proxy (handles registry assignments)
   useEffect(() => {
-    if (
-      !loading &&
-      connections.length === 0 &&
-      providerInfo &&
-      !isCompatible &&
-      !hasAutoOpened.current &&
-      !userDismissed.current
-    ) {
-      hasAutoOpened.current = true;
-      if (isOAuth) {
-        setShowOAuthModal(true);
-      } else {
-        setShowAddApiKeyModal(true);
-      }
+    if (!loading && connections.length > 0) {
+      void loadConnProxies(connections);
     }
-  }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [loading, connections, loadConnProxies]);
 
   const handleSetAlias = async (modelId, alias, providerAliasOverride = providerAlias) => {
     const fullModel = `${providerAliasOverride}/${modelId}`;
@@ -710,6 +1077,10 @@ export default function ProviderDetailPage() {
       const res = await fetch(`/api/providers/${id}`, { method: "DELETE" });
       if (res.ok) {
         setConnections(connections.filter((c) => c.id !== id));
+        // Refresh model list after connection deletion (synced models may change)
+        if (providerId === "gemini") {
+          await fetchProviderModelMeta();
+        }
       }
     } catch (error) {
       console.log("Error deleting connection:", error);
@@ -721,6 +1092,14 @@ export default function ProviderDetailPage() {
     setShowOAuthModal(false);
   }, [fetchConnections]);
 
+  const openPrimaryAddFlow = useCallback(() => {
+    if (isOAuth) {
+      setShowOAuthModal(true);
+      return;
+    }
+    setShowAddApiKeyModal(true);
+  }, [isOAuth]);
+
   const handleSaveApiKey = async (formData) => {
     try {
       const res = await fetch("/api/providers", {
@@ -729,8 +1108,72 @@ export default function ProviderDetailPage() {
         body: JSON.stringify({ provider: providerId, ...formData }),
       });
       if (res.ok) {
+        const connectionData = await res.json();
+        const newConnection = connectionData?.connection;
         await fetchConnections();
         setShowAddApiKeyModal(false);
+
+        // For Gemini: show progress dialog and sync models from endpoint
+        if (providerId === "gemini" && newConnection?.id) {
+          setShowImportModal(true);
+          setImportProgress({
+            current: 0,
+            total: 0,
+            phase: "fetching",
+            status: t("fetchingModels"),
+            logs: [],
+            error: "",
+            importedCount: 0,
+          });
+
+          try {
+            const syncRes = await fetch(`/api/providers/${newConnection.id}/sync-models`, {
+              method: "POST",
+              signal: AbortSignal.timeout(30_000), // 30s timeout — model sync shouldn't hang
+            });
+            const syncData = await syncRes.json();
+
+            if (!syncRes.ok || syncData.error) {
+              setImportProgress((prev) => ({
+                ...prev,
+                phase: "error",
+                status: t("failedFetchModels"),
+                error: syncData.error?.message || syncData.error || t("failedImportModels"),
+              }));
+              return null;
+            }
+
+            const syncedCount = syncData.syncedModels || 0;
+            const syncedModelList: Array<{ id: string; name?: string }> = syncData.models || [];
+            const logs: string[] = [];
+            if (syncedModelList.length > 0) {
+              logs.push(`✓ ${syncedCount} models available`);
+              logs.push("");
+              for (const m of syncedModelList) {
+                logs.push(`  ${m.name || m.id}`);
+              }
+            }
+
+            setImportProgress((prev) => ({
+              ...prev,
+              phase: "done",
+              status: t("modelsImported", { count: syncedCount }),
+              total: syncedCount,
+              current: syncedCount,
+              importedCount: syncedCount,
+              logs,
+            }));
+
+            await fetchProviderModelMeta();
+          } catch (syncError) {
+            setImportProgress((prev) => ({
+              ...prev,
+              phase: "error",
+              status: t("failedFetchModels"),
+              error: String(syncError),
+            }));
+          }
+        }
         return null;
       }
       const data = await res.json().catch(() => ({}));
@@ -917,6 +1360,39 @@ export default function ProviderDetailPage() {
 
   // T12: Manual token refresh
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
+
+  const parseApiErrorMessage = async (res: Response, fallback: string) => {
+    const contentType = res.headers.get("content-type") || "";
+
+    if (contentType.includes("application/json")) {
+      const data = await res.json().catch(() => ({}));
+      if (typeof data?.error === "string" && data.error.trim()) {
+        return data.error;
+      }
+      if (data?.error?.message) {
+        return data.error.message;
+      }
+    }
+
+    const text = await res.text().catch(() => "");
+    return text.trim() || fallback;
+  };
+
+  const getAttachmentFilename = (res: Response, fallback: string) => {
+    const disposition = res.headers.get("content-disposition") || "";
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match?.[1]) {
+      return decodeURIComponent(utf8Match[1]);
+    }
+
+    const plainMatch = disposition.match(/filename="([^"]+)"/i);
+    if (plainMatch?.[1]) {
+      return plainMatch[1];
+    }
+
+    return fallback;
+  };
+
   const handleRefreshToken = async (connectionId: string) => {
     if (refreshingId) return;
     setRefreshingId(connectionId);
@@ -934,6 +1410,82 @@ export default function ProviderDetailPage() {
       notify.error(t("tokenRefreshFailed"));
     } finally {
       setRefreshingId(null);
+    }
+  };
+
+  const handleApplyCodexAuthLocal = async (connectionId: string) => {
+    if (applyingCodexAuthId) return;
+    setApplyingCodexAuthId(connectionId);
+
+    const defaultSuccess =
+      typeof t.has === "function" && t.has("codexAuthAppliedLocal")
+        ? t("codexAuthAppliedLocal")
+        : "Codex auth.json applied locally";
+    const defaultError =
+      typeof t.has === "function" && t.has("codexAuthApplyFailed")
+        ? t("codexAuthApplyFailed")
+        : "Failed to apply Codex auth.json locally";
+
+    try {
+      const res = await fetch(`/api/providers/${connectionId}/codex-auth/apply-local`, {
+        method: "POST",
+      });
+
+      if (!res.ok) {
+        notify.error(await parseApiErrorMessage(res, defaultError));
+        return;
+      }
+
+      notify.success(defaultSuccess);
+    } catch (error) {
+      console.error("Error applying Codex auth locally:", error);
+      notify.error(defaultError);
+    } finally {
+      setApplyingCodexAuthId(null);
+    }
+  };
+
+  const handleExportCodexAuthFile = async (connectionId: string) => {
+    if (exportingCodexAuthId) return;
+    setExportingCodexAuthId(connectionId);
+
+    const defaultSuccess =
+      typeof t.has === "function" && t.has("codexAuthExported")
+        ? t("codexAuthExported")
+        : "Codex auth.json exported";
+    const defaultError =
+      typeof t.has === "function" && t.has("codexAuthExportFailed")
+        ? t("codexAuthExportFailed")
+        : "Failed to export Codex auth.json";
+
+    try {
+      const res = await fetch(`/api/providers/${connectionId}/codex-auth/export`, {
+        method: "POST",
+      });
+
+      if (!res.ok) {
+        notify.error(await parseApiErrorMessage(res, defaultError));
+        return;
+      }
+
+      const blob = await res.blob();
+      const filename = getAttachmentFilename(res, "codex-auth.json");
+      const objectUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+
+      link.href = objectUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1000);
+
+      notify.success(defaultSuccess);
+    } catch (error) {
+      console.error("Error exporting Codex auth file:", error);
+      notify.error(defaultError);
+    } finally {
+      setExportingCodexAuthId(null);
     }
   };
 
@@ -1014,17 +1566,47 @@ export default function ProviderDetailPage() {
         return;
       }
 
+      const existingIds = new Set([
+        ...(modelMeta.customModels || []).map((m: any) => m.id),
+        ...models.map((m: any) => m.id),
+      ]);
+      const newModels = fetchedModels.filter(
+        (model: any) => !existingIds.has(model.id || model.name || model.model)
+      );
+
+      if (newModels.length === 0) {
+        setImportProgress((prev) => ({
+          ...prev,
+          phase: "done",
+          status: t("allModelsAlreadyImported") || "All models already imported",
+          logs: [t("noNewModelsToImport") || "No new models to import"],
+          importedCount: 0,
+          total: 0,
+          current: 0,
+        }));
+        return;
+      }
+
       setImportProgress((prev) => ({
         ...prev,
         phase: "importing",
-        total: fetchedModels.length,
-        status: t("importingModelsProgress", { current: 0, total: fetchedModels.length }),
-        logs: [t("foundModelsStartingImport", { count: fetchedModels.length })],
+        total: newModels.length,
+        current: 0,
+        status: t("importingModelsProgress", { current: 0, total: newModels.length }),
+        logs: [
+          t("foundModelsStartingImport", { count: newModels.length }),
+          ...(newModels.length < fetchedModels.length
+            ? [
+                t("skippingExistingModels", { count: fetchedModels.length - newModels.length }) ||
+                  `Skipping ${fetchedModels.length - newModels.length} existing models`,
+              ]
+            : []),
+        ],
       }));
 
       let importedCount = 0;
-      for (let i = 0; i < fetchedModels.length; i++) {
-        const model = fetchedModels[i];
+      for (let i = 0; i < newModels.length; i++) {
+        const model = newModels[i];
         const modelId = model.id || model.name || model.model;
         if (!modelId) continue;
         const parts = modelId.split("/");
@@ -1033,7 +1615,7 @@ export default function ProviderDetailPage() {
         setImportProgress((prev) => ({
           ...prev,
           current: i + 1,
-          status: t("importingModelsProgress", { current: i + 1, total: fetchedModels.length }),
+          status: t("importingModelsProgress", { current: i + 1, total: newModels.length }),
           logs: [...prev.logs, t("importingModelById", { modelId })],
         }));
 
@@ -1060,7 +1642,7 @@ export default function ProviderDetailPage() {
       setImportProgress((prev) => ({
         ...prev,
         phase: "done",
-        current: fetchedModels.length,
+        current: newModels.length,
         status:
           importedCount > 0
             ? t("importSuccessCount", { count: importedCount })
@@ -1182,10 +1764,83 @@ export default function ProviderDetailPage() {
 
   const canImportModels = connections.some((conn) => conn.isActive !== false);
 
+  // Auto-sync toggle state: read from first active connection's providerSpecificData
+  const autoSyncConnection = connections.find((conn: any) => conn.isActive !== false);
+  const isAutoSyncEnabled = !!(autoSyncConnection as any)?.providerSpecificData?.autoSync;
+  const [togglingAutoSync, setTogglingAutoSync] = useState(false);
+
+  const handleToggleAutoSync = async () => {
+    if (!autoSyncConnection || togglingAutoSync) return;
+    setTogglingAutoSync(true);
+    try {
+      const newValue = !isAutoSyncEnabled;
+      await fetch(`/api/providers/${(autoSyncConnection as any).id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          providerSpecificData: { autoSync: newValue },
+        }),
+      });
+      await fetchConnections();
+      notify[newValue ? "success" : "info"](
+        newValue ? t("autoSyncEnabled") : t("autoSyncDisabled")
+      );
+    } catch (error) {
+      console.log("Error toggling auto-sync:", error);
+      notify.error(t("autoSyncToggleFailed"));
+    } finally {
+      setTogglingAutoSync(false);
+    }
+  };
+
+  const [clearingModels, setClearingModels] = useState(false);
+  const providerAliasEntries = useMemo(
+    () =>
+      Object.entries(modelAliases).filter(([, model]) =>
+        (model as string).startsWith(`${providerStorageAlias}/`)
+      ),
+    [modelAliases, providerStorageAlias]
+  );
+
+  const handleClearAllModels = async () => {
+    if (clearingModels) return;
+    if (!confirm(t("clearAllModelsConfirm"))) return;
+    setClearingModels(true);
+    try {
+      const res = await fetch(
+        `/api/provider-models?provider=${encodeURIComponent(providerStorageAlias)}&all=true`,
+        { method: "DELETE" }
+      );
+      if (res.ok) {
+        // Also delete all aliases that belong to this provider
+        await Promise.all(
+          providerAliasEntries.map(([alias]) =>
+            fetch(`/api/models/alias?alias=${encodeURIComponent(alias)}`, {
+              method: "DELETE",
+            }).catch(() => {})
+          )
+        );
+        await fetchProviderModelMeta();
+        await fetchAliases();
+        notify.success(t("clearAllModelsSuccess"));
+      } else {
+        notify.error(t("clearAllModelsFailed"));
+      }
+    } catch {
+      notify.error(t("clearAllModelsFailed"));
+    } finally {
+      setClearingModels(false);
+    }
+  };
+
   const customMap = useMemo(() => buildCompatMap(modelMeta.customModels), [modelMeta.customModels]);
   const overrideMap = useMemo(
     () => buildCompatMap(modelMeta.modelCompatOverrides),
     [modelMeta.modelCompatOverrides]
+  );
+  const compatibleFallbackModels = useMemo(
+    () => getCompatibleFallbackModels(providerId, modelMeta.customModels),
+    [providerId, modelMeta.customModels]
   );
 
   const effectiveModelNormalize = (modelId: string, protocol = MODEL_COMPAT_PROTOCOL_KEYS[0]) =>
@@ -1196,14 +1851,13 @@ export default function ProviderDetailPage() {
     protocol = MODEL_COMPAT_PROTOCOL_KEYS[0]
   ) => effectivePreserveForProtocol(modelId, protocol, customMap, overrideMap);
 
-  const saveModelCompatFlags = async (
-    modelId: string,
-    patch: {
-      normalizeToolCallId?: boolean;
-      preserveOpenAIDeveloperRole?: boolean;
-      compatByProtocol?: CompatByProtocolMap;
-    }
-  ) => {
+  const getUpstreamHeadersRecordForModel = useCallback(
+    (modelId: string, protocol: string) =>
+      effectiveUpstreamHeadersForProtocol(modelId, protocol, customMap, overrideMap),
+    [customMap, overrideMap]
+  );
+
+  const saveModelCompatFlags = async (modelId: string, patch: ModelCompatSavePatch) => {
     setCompatSavingModelId(modelId);
     try {
       const c = customMap.get(modelId) as Record<string, unknown> | undefined;
@@ -1211,7 +1865,8 @@ export default function ProviderDetailPage() {
       const onlyCompatByProtocol =
         patch.compatByProtocol &&
         patch.normalizeToolCallId === undefined &&
-        patch.preserveOpenAIDeveloperRole === undefined;
+        patch.preserveOpenAIDeveloperRole === undefined &&
+        !("upstreamHeaders" in patch);
 
       if (c) {
         if (onlyCompatByProtocol) {
@@ -1253,7 +1908,10 @@ export default function ProviderDetailPage() {
         body: JSON.stringify(body),
       });
       if (!res.ok) {
-        notify.error(t("failedSaveCustomModel"));
+        const detail = await formatProviderModelsErrorResponse(res);
+        notify.error(
+          detail ? `${t("failedSaveCustomModel")} — ${detail}` : t("failedSaveCustomModel")
+        );
         return;
       }
     } catch {
@@ -1270,28 +1928,89 @@ export default function ProviderDetailPage() {
   };
 
   const renderModelsSection = () => {
-    if (isCompatible) {
+    const autoSyncToggle = compatibleSupportsModelImport && canImportModels && (
+      <button
+        onClick={handleToggleAutoSync}
+        disabled={togglingAutoSync}
+        className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-border bg-transparent cursor-pointer text-[12px] disabled:opacity-50 disabled:cursor-not-allowed"
+        title={t("autoSyncTooltip")}
+      >
+        <span
+          className="material-symbols-outlined text-[16px]"
+          style={{ color: isAutoSyncEnabled ? "#22c55e" : "var(--color-text-muted)" }}
+        >
+          {isAutoSyncEnabled ? "toggle_on" : "toggle_off"}
+        </span>
+        <span className="text-text-main">{t("autoSync")}</span>
+      </button>
+    );
+
+    const clearAllButton = (modelMeta.customModels.length > 0 ||
+      providerAliasEntries.length > 0) && (
+      <button
+        onClick={handleClearAllModels}
+        disabled={clearingModels}
+        className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-red-300 dark:border-red-800 bg-transparent cursor-pointer text-[12px] text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50 disabled:cursor-not-allowed"
+        title={t("clearAllModels")}
+      >
+        <span className="material-symbols-outlined text-[16px]">delete_sweep</span>
+        <span>{t("clearAllModels")}</span>
+      </button>
+    );
+
+    if (isManagedAvailableModelsProvider) {
+      const description =
+        providerId === "openrouter"
+          ? t("openRouterAnyModelHint")
+          : isCcCompatible
+            ? "CC Compatible available models mirror the OAuth Claude Code provider list."
+            : t("compatibleModelsDescription", {
+                type: isAnthropicCompatible ? t("anthropic") : t("openai"),
+              });
+      const inputLabel = providerId === "openrouter" ? t("modelIdFromOpenRouter") : t("modelId");
+      const inputPlaceholder =
+        providerId === "openrouter"
+          ? t("openRouterModelPlaceholder")
+          : isCcCompatible
+            ? "claude-sonnet-4-6"
+            : isAnthropicCompatible
+              ? t("anthropicCompatibleModelPlaceholder")
+              : t("openaiCompatibleModelPlaceholder");
+
       return (
-        <CompatibleModelsSection
-          providerStorageAlias={providerStorageAlias}
-          providerDisplayAlias={providerDisplayAlias}
-          modelAliases={modelAliases}
-          copied={copied}
-          onCopy={copy}
-          onSetAlias={handleSetAlias}
-          onDeleteAlias={handleDeleteAlias}
-          connections={connections}
-          isAnthropic={isAnthropicCompatible}
-          onImportWithProgress={handleCompatibleImportWithProgress}
-          t={t}
-          effectiveModelNormalize={effectiveModelNormalize}
-          effectiveModelPreserveDeveloper={effectiveModelPreserveDeveloper}
-          saveModelCompatFlags={saveModelCompatFlags}
-          compatSavingModelId={compatSavingModelId}
-          onModelsChanged={fetchProviderModelMeta}
-        />
+        <div>
+          <div className="flex items-center gap-2 mb-4">
+            {autoSyncToggle}
+            {clearAllButton}
+          </div>
+          <CompatibleModelsSection
+            providerStorageAlias={providerStorageAlias}
+            providerDisplayAlias={providerDisplayAlias}
+            modelAliases={modelAliases}
+            fallbackModels={compatibleFallbackModels}
+            description={description}
+            inputLabel={inputLabel}
+            inputPlaceholder={inputPlaceholder}
+            copied={copied}
+            onCopy={copy}
+            onSetAlias={handleSetAlias}
+            onDeleteAlias={handleDeleteAlias}
+            connections={connections}
+            isAnthropic={isAnthropicProtocolCompatible}
+            onImportWithProgress={handleCompatibleImportWithProgress}
+            t={t}
+            effectiveModelNormalize={effectiveModelNormalize}
+            effectiveModelPreserveDeveloper={effectiveModelPreserveDeveloper}
+            getUpstreamHeadersRecord={getUpstreamHeadersRecordForModel}
+            saveModelCompatFlags={saveModelCompatFlags}
+            compatSavingModelId={compatSavingModelId}
+            onModelsChanged={fetchProviderModelMeta}
+            allowImport={compatibleSupportsModelImport}
+          />
+        </div>
       );
     }
+
     if (providerInfo.passthroughModels) {
       return (
         <div>
@@ -1305,6 +2024,8 @@ export default function ProviderDetailPage() {
             >
               {importingModels ? t("importingModels") : t("importFromModels")}
             </Button>
+            {autoSyncToggle}
+            {clearAllButton}
             {!canImportModels && (
               <span className="text-xs text-text-muted">{t("addConnectionToImport")}</span>
             )}
@@ -1319,6 +2040,7 @@ export default function ProviderDetailPage() {
             t={t}
             effectiveModelNormalize={effectiveModelNormalize}
             effectiveModelPreserveDeveloper={effectiveModelPreserveDeveloper}
+            getUpstreamHeadersRecord={getUpstreamHeadersRecordForModel}
             saveModelCompatFlags={saveModelCompatFlags}
             compatSavingModelId={compatSavingModelId}
           />
@@ -1326,22 +2048,24 @@ export default function ProviderDetailPage() {
       );
     }
 
-    const importButton = (
-      <div className="flex items-center gap-2 mb-4">
-        <Button
-          size="sm"
-          variant="secondary"
-          icon="download"
-          onClick={handleImportModels}
-          disabled={!canImportModels || importingModels}
-        >
-          {importingModels ? t("importingModels") : t("importFromModels")}
-        </Button>
-        {!canImportModels && (
-          <span className="text-xs text-text-muted">{t("addConnectionToImport")}</span>
-        )}
-      </div>
-    );
+    const importButton =
+      providerId === "gemini" ? null : (
+        <div className="flex items-center gap-2 mb-4">
+          <Button
+            size="sm"
+            variant="secondary"
+            icon="download"
+            onClick={handleImportModels}
+            disabled={!canImportModels || importingModels}
+          >
+            {importingModels ? t("importingModels") : t("importFromModels")}
+          </Button>
+          {autoSyncToggle}
+          {!canImportModels && (
+            <span className="text-xs text-text-muted">{t("addConnectionToImport")}</span>
+          )}
+        </div>
+      );
 
     if (models.length === 0) {
       return (
@@ -1356,23 +2080,18 @@ export default function ProviderDetailPage() {
         {importButton}
         <div className="flex flex-wrap gap-3">
           {models.map((model) => {
-            const fullModel = `${providerStorageAlias}/${model.id}`;
-            const oldFormatModel = `${providerId}/${model.id}`;
-            const existingAlias = Object.entries(modelAliases).find(
-              ([, m]) => m === fullModel || m === oldFormatModel
-            )?.[0];
             return (
               <ModelRow
                 key={model.id}
                 model={model}
                 fullModel={`${providerDisplayAlias}/${model.id}`}
-                alias={existingAlias}
                 copied={copied}
                 onCopy={copy}
                 t={t}
                 showDeveloperToggle
                 effectiveModelNormalize={effectiveModelNormalize}
                 effectiveModelPreserveDeveloper={effectiveModelPreserveDeveloper}
+                getUpstreamHeadersRecord={(p) => getUpstreamHeadersRecordForModel(model.id, p)}
                 saveModelCompatFlags={saveModelCompatFlags}
                 compatDisabled={compatSavingModelId === model.id}
               />
@@ -1410,7 +2129,7 @@ export default function ProviderDetailPage() {
         ? "/providers/oai-r.png"
         : "/providers/oai-cc.png";
     }
-    if (isAnthropicCompatible) {
+    if (isAnthropicProtocolCompatible) {
       return "/providers/anthropic-m.png";
     }
     return `/providers/${providerInfo.id}.png`;
@@ -1475,22 +2194,26 @@ export default function ProviderDetailPage() {
           <div className="flex items-center justify-between mb-4">
             <div>
               <h2 className="text-lg font-semibold">
-                {isAnthropicCompatible
-                  ? t("anthropicCompatibleDetails")
-                  : t("openaiCompatibleDetails")}
+                {isCcCompatible
+                  ? CC_COMPATIBLE_DETAILS_TITLE
+                  : isAnthropicCompatible
+                    ? t("anthropicCompatibleDetails")
+                    : t("openaiCompatibleDetails")}
               </h2>
               <p className="text-sm text-text-muted">
-                {isAnthropicCompatible
+                {isAnthropicProtocolCompatible
                   ? t("messagesApi")
                   : providerNode.apiType === "responses"
                     ? t("responsesApi")
                     : t("chatCompletions")}{" "}
                 · {(providerNode.baseUrl || "").replace(/\/$/, "")}/
-                {isAnthropicCompatible
-                  ? t("messagesPath")
-                  : providerNode.apiType === "responses"
-                    ? t("responsesPath")
-                    : t("chatCompletionsPath")}
+                {isCcCompatible
+                  ? (providerNode.chatPath || CC_COMPATIBLE_DEFAULT_CHAT_PATH).replace(/^\//, "")
+                  : isAnthropicCompatible
+                    ? (providerNode.chatPath || "/messages").replace(/^\//, "")
+                    : providerNode.apiType === "responses"
+                      ? (providerNode.chatPath || "/responses").replace(/^\//, "")
+                      : (providerNode.chatPath || "/chat/completions").replace(/^\//, "")}
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -1518,7 +2241,11 @@ export default function ProviderDetailPage() {
                   if (
                     !confirm(
                       t("deleteCompatibleNodeConfirm", {
-                        type: isAnthropicCompatible ? t("anthropic") : t("openai"),
+                        type: isCcCompatible
+                          ? CC_COMPATIBLE_LABEL
+                          : isAnthropicCompatible
+                            ? t("anthropic")
+                            : t("openai"),
                       })
                     )
                   )
@@ -1597,13 +2324,16 @@ export default function ProviderDetailPage() {
             </button>
           )}
           {!isCompatible ? (
-            <Button
-              size="sm"
-              icon="add"
-              onClick={() => (isOAuth ? setShowOAuthModal(true) : setShowAddApiKeyModal(true))}
-            >
-              {t("add")}
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button size="sm" icon="add" onClick={openPrimaryAddFlow}>
+                {providerSupportsPat ? "Add PAT" : t("add")}
+              </Button>
+              {providerId === "qoder" && (
+                <Button size="sm" variant="secondary" onClick={() => setShowOAuthModal(true)}>
+                  Experimental OAuth
+                </Button>
+              )}
+            </div>
           ) : (
             connections.length === 0 && (
               <Button size="sm" icon="add" onClick={() => setShowAddApiKeyModal(true)}>
@@ -1623,77 +2353,200 @@ export default function ProviderDetailPage() {
             <p className="text-text-main font-medium mb-1">{t("noConnectionsYet")}</p>
             <p className="text-sm text-text-muted mb-4">{t("addFirstConnectionHint")}</p>
             {!isCompatible && (
-              <Button
-                icon="add"
-                onClick={() => (isOAuth ? setShowOAuthModal(true) : setShowAddApiKeyModal(true))}
-              >
-                {t("addConnection")}
-              </Button>
+              <div className="flex items-center justify-center gap-2">
+                <Button icon="add" onClick={openPrimaryAddFlow}>
+                  {providerSupportsPat ? "Add PAT" : t("addConnection")}
+                </Button>
+                {providerId === "qoder" && (
+                  <Button variant="secondary" onClick={() => setShowOAuthModal(true)}>
+                    Experimental OAuth
+                  </Button>
+                )}
+              </div>
             )}
           </div>
         ) : (
-          <div className="flex flex-col divide-y divide-black/[0.03] dark:divide-white/[0.03]">
-            {connections
-              .sort((a, b) => (a.priority || 0) - (b.priority || 0))
-              .map((conn, index) => (
-                <ConnectionRow
-                  key={conn.id}
-                  connection={conn}
-                  isOAuth={isOAuth}
-                  isFirst={index === 0}
-                  isLast={index === connections.length - 1}
-                  onMoveUp={() => handleSwapPriority(conn, connections[index - 1])}
-                  onMoveDown={() => handleSwapPriority(conn, connections[index + 1])}
-                  onToggleActive={(isActive) => handleUpdateConnectionStatus(conn.id, isActive)}
-                  onToggleRateLimit={(enabled) => handleToggleRateLimit(conn.id, enabled)}
-                  isCodex={providerId === "codex"}
-                  onToggleCodex5h={(enabled) => handleToggleCodexLimit(conn.id, "use5h", enabled)}
-                  onToggleCodexWeekly={(enabled) =>
-                    handleToggleCodexLimit(conn.id, "useWeekly", enabled)
-                  }
-                  onRetest={() => handleRetestConnection(conn.id)}
-                  isRetesting={retestingId === conn.id}
-                  onEdit={() => {
-                    setSelectedConnection(conn);
-                    setShowEditModal(true);
-                  }}
-                  onDelete={() => handleDelete(conn.id)}
-                  onReauth={isOAuth ? () => setShowOAuthModal(true) : undefined}
-                  onRefreshToken={isOAuth ? () => handleRefreshToken(conn.id) : undefined}
-                  isRefreshing={refreshingId === conn.id}
-                  onProxy={() =>
-                    setProxyTarget({
-                      level: "key",
-                      id: conn.id,
-                      label: conn.name || conn.email || conn.id,
-                    })
-                  }
-                  hasProxy={
-                    !!(
-                      proxyConfig?.keys?.[conn.id] ||
-                      proxyConfig?.providers?.[providerId] ||
-                      proxyConfig?.global
-                    )
-                  }
-                  proxySource={
-                    proxyConfig?.keys?.[conn.id]
-                      ? "key"
-                      : proxyConfig?.providers?.[providerId]
-                        ? "provider"
-                        : proxyConfig?.global
-                          ? "global"
-                          : null
-                  }
-                  proxyHost={
-                    (
-                      proxyConfig?.keys?.[conn.id] ||
-                      proxyConfig?.providers?.[providerId] ||
-                      proxyConfig?.global
-                    )?.host || null
-                  }
-                />
-              ))}
-          </div>
+          (() => {
+            // Group connections by tag (providerSpecificData.tag)
+            const sorted = [...connections].sort((a, b) => (a.priority || 0) - (b.priority || 0));
+            const hasAnyTag = sorted.some((c) => c.providerSpecificData?.tag as string | undefined);
+
+            if (!hasAnyTag) {
+              // No tags — render flat list as before
+              return (
+                <div className="flex flex-col divide-y divide-black/[0.03] dark:divide-white/[0.03]">
+                  {sorted.map((conn, index) => (
+                    <ConnectionRow
+                      key={conn.id}
+                      connection={conn}
+                      isOAuth={conn.authType === "oauth"}
+                      isFirst={index === 0}
+                      isLast={index === sorted.length - 1}
+                      onMoveUp={() => handleSwapPriority(conn, sorted[index - 1])}
+                      onMoveDown={() => handleSwapPriority(conn, sorted[index + 1])}
+                      onToggleActive={(isActive) => handleUpdateConnectionStatus(conn.id, isActive)}
+                      onToggleRateLimit={(enabled) => handleToggleRateLimit(conn.id, enabled)}
+                      isCodex={providerId === "codex"}
+                      onToggleCodex5h={(enabled) =>
+                        handleToggleCodexLimit(conn.id, "use5h", enabled)
+                      }
+                      onToggleCodexWeekly={(enabled) =>
+                        handleToggleCodexLimit(conn.id, "useWeekly", enabled)
+                      }
+                      onRetest={() => handleRetestConnection(conn.id)}
+                      isRetesting={retestingId === conn.id}
+                      onEdit={() => {
+                        setSelectedConnection(conn);
+                        setShowEditModal(true);
+                      }}
+                      onDelete={() => handleDelete(conn.id)}
+                      onReauth={
+                        conn.authType === "oauth" ? () => setShowOAuthModal(true) : undefined
+                      }
+                      onRefreshToken={
+                        conn.authType === "oauth" ? () => handleRefreshToken(conn.id) : undefined
+                      }
+                      isRefreshing={refreshingId === conn.id}
+                      onApplyCodexAuthLocal={
+                        providerId === "codex"
+                          ? () => handleApplyCodexAuthLocal(conn.id)
+                          : undefined
+                      }
+                      isApplyingCodexAuthLocal={applyingCodexAuthId === conn.id}
+                      onExportCodexAuthFile={
+                        providerId === "codex"
+                          ? () => handleExportCodexAuthFile(conn.id)
+                          : undefined
+                      }
+                      isExportingCodexAuthFile={exportingCodexAuthId === conn.id}
+                      onProxy={() =>
+                        setProxyTarget({
+                          level: "key",
+                          id: conn.id,
+                          label: conn.name || conn.email || conn.id,
+                        })
+                      }
+                      hasProxy={!!connProxyMap[conn.id]?.proxy}
+                      proxySource={connProxyMap[conn.id]?.level || null}
+                      proxyHost={connProxyMap[conn.id]?.proxy?.host || null}
+                    />
+                  ))}
+                </div>
+              );
+            }
+
+            // Build ordered tag groups: untagged first, then alphabetically
+            const groupMap = new Map<string, typeof sorted>();
+            for (const conn of sorted) {
+              const tag = (conn.providerSpecificData?.tag as string | undefined)?.trim() || "";
+              if (!groupMap.has(tag)) groupMap.set(tag, []);
+              groupMap.get(tag)!.push(conn);
+            }
+            const groupKeys = Array.from(groupMap.keys()).sort((a, b) => {
+              if (a === "") return -1;
+              if (b === "") return 1;
+              return a.localeCompare(b);
+            });
+
+            return (
+              <div className="flex flex-col gap-0">
+                {groupKeys.map((tag, gi) => {
+                  const groupConns = groupMap.get(tag)!;
+                  return (
+                    <div
+                      key={tag || "__untagged__"}
+                      className={
+                        gi > 0
+                          ? "border-t border-black/[0.06] dark:border-white/[0.06] mt-1 pt-1"
+                          : ""
+                      }
+                    >
+                      {tag && (
+                        <div className="flex items-center gap-2 px-3 pt-2 pb-1">
+                          <span className="material-symbols-outlined text-[13px] text-text-muted/50">
+                            label
+                          </span>
+                          <span className="text-[11px] font-semibold uppercase tracking-widest text-text-muted/60 select-none">
+                            {tag}
+                          </span>
+                          <div className="flex-1 h-px bg-black/[0.04] dark:bg-white/[0.04]" />
+                          <span className="text-[10px] text-text-muted/40">
+                            {groupConns.length}
+                          </span>
+                        </div>
+                      )}
+                      <div className="flex flex-col divide-y divide-black/[0.03] dark:divide-white/[0.03]">
+                        {groupConns.map((conn, index) => (
+                          <ConnectionRow
+                            key={conn.id}
+                            connection={conn}
+                            isOAuth={conn.authType === "oauth"}
+                            isFirst={gi === 0 && index === 0}
+                            isLast={gi === groupKeys.length - 1 && index === groupConns.length - 1}
+                            onMoveUp={() =>
+                              handleSwapPriority(conn, sorted[sorted.indexOf(conn) - 1])
+                            }
+                            onMoveDown={() =>
+                              handleSwapPriority(conn, sorted[sorted.indexOf(conn) + 1])
+                            }
+                            onToggleActive={(isActive) =>
+                              handleUpdateConnectionStatus(conn.id, isActive)
+                            }
+                            onToggleRateLimit={(enabled) => handleToggleRateLimit(conn.id, enabled)}
+                            isCodex={providerId === "codex"}
+                            onToggleCodex5h={(enabled) =>
+                              handleToggleCodexLimit(conn.id, "use5h", enabled)
+                            }
+                            onToggleCodexWeekly={(enabled) =>
+                              handleToggleCodexLimit(conn.id, "useWeekly", enabled)
+                            }
+                            onRetest={() => handleRetestConnection(conn.id)}
+                            isRetesting={retestingId === conn.id}
+                            onEdit={() => {
+                              setSelectedConnection(conn);
+                              setShowEditModal(true);
+                            }}
+                            onDelete={() => handleDelete(conn.id)}
+                            onReauth={
+                              conn.authType === "oauth" ? () => setShowOAuthModal(true) : undefined
+                            }
+                            onRefreshToken={
+                              conn.authType === "oauth"
+                                ? () => handleRefreshToken(conn.id)
+                                : undefined
+                            }
+                            isRefreshing={refreshingId === conn.id}
+                            onApplyCodexAuthLocal={
+                              providerId === "codex"
+                                ? () => handleApplyCodexAuthLocal(conn.id)
+                                : undefined
+                            }
+                            isApplyingCodexAuthLocal={applyingCodexAuthId === conn.id}
+                            onExportCodexAuthFile={
+                              providerId === "codex"
+                                ? () => handleExportCodexAuthFile(conn.id)
+                                : undefined
+                            }
+                            isExportingCodexAuthFile={exportingCodexAuthId === conn.id}
+                            onProxy={() =>
+                              setProxyTarget({
+                                level: "key",
+                                id: conn.id,
+                                label: conn.name || conn.email || conn.id,
+                              })
+                            }
+                            hasProxy={!!connProxyMap[conn.id]?.proxy}
+                            proxySource={connProxyMap[conn.id]?.level || null}
+                            proxyHost={connProxyMap[conn.id]?.proxy?.host || null}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()
         )}
       </Card>
 
@@ -1703,8 +2556,8 @@ export default function ProviderDetailPage() {
           <h2 className="text-lg font-semibold mb-4">{t("availableModels")}</h2>
           {renderModelsSection()}
 
-          {/* Custom Models — available for non-compatible, non-search providers */}
-          {!isCompatible && (
+          {/* Custom Models — available for providers without managed available-model metadata */}
+          {!isManagedAvailableModelsProvider && providerId !== "gemini" && (
             <CustomModelsSection
               providerId={providerId}
               providerAlias={providerDisplayAlias}
@@ -1743,7 +2596,6 @@ export default function ProviderDetailPage() {
           providerInfo={providerInfo}
           onSuccess={handleOAuthSuccess}
           onClose={() => {
-            userDismissed.current = true;
             setShowOAuthModal(false);
           }}
         />
@@ -1752,7 +2604,6 @@ export default function ProviderDetailPage() {
           isOpen={showOAuthModal}
           onSuccess={handleOAuthSuccess}
           onClose={() => {
-            userDismissed.current = true;
             setShowOAuthModal(false);
           }}
         />
@@ -1763,7 +2614,6 @@ export default function ProviderDetailPage() {
           providerInfo={providerInfo}
           onSuccess={handleOAuthSuccess}
           onClose={() => {
-            userDismissed.current = true;
             setShowOAuthModal(false);
           }}
         />
@@ -1773,7 +2623,8 @@ export default function ProviderDetailPage() {
         provider={providerId}
         providerName={providerInfo.name}
         isCompatible={isCompatible}
-        isAnthropic={isAnthropicCompatible}
+        isAnthropic={isAnthropicProtocolCompatible}
+        isCcCompatible={isCcCompatible}
         onSave={handleSaveApiKey}
         onClose={() => setShowAddApiKeyModal(false)}
       />
@@ -1789,7 +2640,8 @@ export default function ProviderDetailPage() {
           node={providerNode}
           onSave={handleUpdateNode}
           onClose={() => setShowEditNodeModal(false)}
-          isAnthropic={isAnthropicCompatible}
+          isAnthropic={isAnthropicProtocolCompatible}
+          isCcCompatible={isCcCompatible}
         />
       )}
       {/* Batch Test Results Modal */}
@@ -1890,6 +2742,7 @@ export default function ProviderDetailPage() {
           level={proxyTarget.level}
           levelId={proxyTarget.id}
           levelLabel={proxyTarget.label}
+          onSaved={() => void loadConnProxies(connections)}
         />
       )}
       {/* Import Progress Modal */}
@@ -1993,11 +2846,16 @@ export default function ProviderDetailPage() {
             </div>
           )}
 
-          {/* Auto-reload notice */}
-          {importProgress.phase === "done" && importProgress.importedCount > 0 && (
-            <p className="text-xs text-text-muted text-center animate-pulse">
-              {t("pageAutoRefresh")}
-            </p>
+          {/* Close button */}
+          {importProgress.phase === "done" && (
+            <div className="flex justify-center">
+              <button
+                onClick={() => setShowImportModal(false)}
+                className="px-4 py-2 text-sm font-medium rounded-lg bg-primary text-white hover:opacity-90 transition-opacity"
+              >
+                {t("close") || "Close"}
+              </button>
+            </div>
           )}
         </div>
       </Modal>
@@ -2008,28 +2866,28 @@ export default function ProviderDetailPage() {
 function ModelRow({
   model,
   fullModel,
-  alias,
   copied,
   onCopy,
   t,
   showDeveloperToggle = true,
   effectiveModelNormalize,
   effectiveModelPreserveDeveloper,
+  getUpstreamHeadersRecord,
   saveModelCompatFlags,
   compatDisabled,
 }: ModelRowProps) {
   return (
-    <div className="flex flex-col px-3 py-2 rounded-lg border border-border hover:bg-sidebar/50 min-w-[220px] max-w-md">
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="material-symbols-outlined text-base text-text-muted shrink-0">
+    <div className="flex min-w-[220px] max-w-md items-center gap-2 rounded-lg border border-border px-3 py-2 hover:bg-sidebar/50">
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+        <span className="material-symbols-outlined shrink-0 text-base text-text-muted">
           smart_toy
         </span>
-        <code className="text-xs text-text-muted font-mono bg-sidebar px-1.5 py-0.5 rounded">
+        <code className="rounded bg-sidebar px-1.5 py-0.5 font-mono text-xs text-text-muted">
           {fullModel}
         </code>
         <button
           onClick={() => onCopy(fullModel, `model-${model.id}`)}
-          className="p-0.5 hover:bg-sidebar rounded text-text-muted hover:text-primary"
+          className="rounded p-0.5 text-text-muted hover:bg-sidebar hover:text-primary"
           title={t("copyModel")}
         >
           <span className="material-symbols-outlined text-sm">
@@ -2037,16 +2895,19 @@ function ModelRow({
           </span>
         </button>
       </div>
-      <ModelCompatPopover
-        t={t}
-        effectiveModelNormalize={(p) => effectiveModelNormalize(model.id, p)}
-        effectiveModelPreserveDeveloper={(p) => effectiveModelPreserveDeveloper(model.id, p)}
-        onCompatPatch={(protocol, payload) =>
-          saveModelCompatFlags(model.id, { compatByProtocol: { [protocol]: payload } })
-        }
-        showDeveloperToggle={showDeveloperToggle}
-        disabled={compatDisabled}
-      />
+      <div className="shrink-0">
+        <ModelCompatPopover
+          t={t}
+          effectiveModelNormalize={(p) => effectiveModelNormalize(model.id, p)}
+          effectiveModelPreserveDeveloper={(p) => effectiveModelPreserveDeveloper(model.id, p)}
+          getUpstreamHeadersRecord={getUpstreamHeadersRecord}
+          onCompatPatch={(protocol, payload) =>
+            saveModelCompatFlags(model.id, { compatByProtocol: { [protocol]: payload } })
+          }
+          showDeveloperToggle={showDeveloperToggle}
+          disabled={compatDisabled}
+        />
+      </div>
     </div>
   );
 }
@@ -2056,13 +2917,13 @@ ModelRow.propTypes = {
     id: PropTypes.string.isRequired,
   }).isRequired,
   fullModel: PropTypes.string.isRequired,
-  alias: PropTypes.string,
   copied: PropTypes.string,
   onCopy: PropTypes.func.isRequired,
   t: PropTypes.func,
   showDeveloperToggle: PropTypes.bool,
   effectiveModelNormalize: PropTypes.func.isRequired,
   effectiveModelPreserveDeveloper: PropTypes.func.isRequired,
+  getUpstreamHeadersRecord: PropTypes.func.isRequired,
   saveModelCompatFlags: PropTypes.func.isRequired,
   compatDisabled: PropTypes.bool,
 };
@@ -2077,6 +2938,7 @@ function PassthroughModelsSection({
   t,
   effectiveModelNormalize,
   effectiveModelPreserveDeveloper,
+  getUpstreamHeadersRecord,
   saveModelCompatFlags,
   compatSavingModelId,
 }: PassthroughModelsSectionProps) {
@@ -2161,6 +3023,7 @@ function PassthroughModelsSection({
               showDeveloperToggle
               effectiveModelNormalize={effectiveModelNormalize}
               effectiveModelPreserveDeveloper={effectiveModelPreserveDeveloper}
+              getUpstreamHeadersRecord={(p) => getUpstreamHeadersRecord(modelId, p)}
               saveModelCompatFlags={saveModelCompatFlags}
               compatDisabled={compatSavingModelId === modelId}
             />
@@ -2181,6 +3044,7 @@ PassthroughModelsSection.propTypes = {
   t: PropTypes.func.isRequired,
   effectiveModelNormalize: PropTypes.func.isRequired,
   effectiveModelPreserveDeveloper: PropTypes.func.isRequired,
+  getUpstreamHeadersRecord: PropTypes.func.isRequired,
   saveModelCompatFlags: PropTypes.func.isRequired,
   compatSavingModelId: PropTypes.string,
 };
@@ -2195,24 +3059,25 @@ function PassthroughModelRow({
   showDeveloperToggle = true,
   effectiveModelNormalize,
   effectiveModelPreserveDeveloper,
+  getUpstreamHeadersRecord,
   saveModelCompatFlags,
   compatDisabled,
 }: PassthroughModelRowProps) {
   return (
-    <div className="flex flex-col gap-0 p-3 rounded-lg border border-border hover:bg-sidebar/50">
-      <div className="flex items-start gap-3">
-        <span className="material-symbols-outlined text-base text-text-muted shrink-0">
+    <div className="flex gap-0 rounded-lg border border-border p-3 hover:bg-sidebar/50">
+      <div className="flex min-w-0 flex-1 items-start gap-3">
+        <span className="material-symbols-outlined shrink-0 text-base text-text-muted">
           smart_toy
         </span>
-        <div className="flex-1 min-w-0">
-          <p className="text-sm font-medium truncate">{modelId}</p>
-          <div className="flex items-center gap-1 mt-1 flex-wrap">
-            <code className="text-xs text-text-muted font-mono bg-sidebar px-1.5 py-0.5 rounded">
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-medium">{modelId}</p>
+          <div className="mt-1 flex flex-wrap items-center gap-1">
+            <code className="rounded bg-sidebar px-1.5 py-0.5 font-mono text-xs text-text-muted">
               {fullModel}
             </code>
             <button
               onClick={() => onCopy(fullModel, `model-${modelId}`)}
-              className="p-0.5 hover:bg-sidebar rounded text-text-muted hover:text-primary"
+              className="rounded p-0.5 text-text-muted hover:bg-sidebar hover:text-primary"
               title={t("copyModel")}
             >
               <span className="material-symbols-outlined text-sm">
@@ -2221,25 +3086,26 @@ function PassthroughModelRow({
             </button>
           </div>
         </div>
-        <button
-          onClick={onDeleteAlias}
-          className="p-1 hover:bg-red-50 rounded text-red-500 shrink-0"
-          title={t("removeModel")}
-        >
-          <span className="material-symbols-outlined text-sm">delete</span>
-        </button>
       </div>
-      <div className="pl-9">
+      <div className="flex shrink-0 items-center gap-1 self-start">
         <ModelCompatPopover
           t={t}
           effectiveModelNormalize={(p) => effectiveModelNormalize(modelId, p)}
           effectiveModelPreserveDeveloper={(p) => effectiveModelPreserveDeveloper(modelId, p)}
+          getUpstreamHeadersRecord={getUpstreamHeadersRecord}
           onCompatPatch={(protocol, payload) =>
             saveModelCompatFlags(modelId, { compatByProtocol: { [protocol]: payload } })
           }
           showDeveloperToggle={showDeveloperToggle}
           disabled={compatDisabled}
         />
+        <button
+          onClick={onDeleteAlias}
+          className="rounded p-1 text-red-500 hover:bg-red-50"
+          title={t("removeModel")}
+        >
+          <span className="material-symbols-outlined text-sm">delete</span>
+        </button>
       </div>
     </div>
   );
@@ -2255,6 +3121,7 @@ PassthroughModelRow.propTypes = {
   showDeveloperToggle: PropTypes.bool,
   effectiveModelNormalize: PropTypes.func.isRequired,
   effectiveModelPreserveDeveloper: PropTypes.func.isRequired,
+  getUpstreamHeadersRecord: PropTypes.func.isRequired,
   saveModelCompatFlags: PropTypes.func.isRequired,
   compatDisabled: PropTypes.bool,
 };
@@ -2381,7 +3248,10 @@ function CustomModelsSection({
         body: JSON.stringify({ provider: providerId, modelId, ...patch }),
       });
       if (!res.ok) {
-        notify.error(t("failedSaveCustomModel"));
+        const detail = await formatProviderModelsErrorResponse(res);
+        notify.error(
+          detail ? `${t("failedSaveCustomModel")} — ${detail}` : t("failedSaveCustomModel")
+        );
         return;
       }
     } catch {
@@ -2422,7 +3292,8 @@ function CustomModelsSection({
       });
 
       if (!res.ok) {
-        throw new Error("Failed to save model endpoint settings");
+        const detail = await formatProviderModelsErrorResponse(res);
+        throw new Error(detail || "Failed to save model endpoint settings");
       }
 
       await fetchCustomModels();
@@ -2431,7 +3302,9 @@ function CustomModelsSection({
       cancelEdit();
     } catch (e) {
       console.error("Failed to save custom model:", e);
-      notify.error("Failed to save model endpoint settings");
+      notify.error(
+        e instanceof Error && e.message ? e.message : "Failed to save model endpoint settings"
+      );
     } finally {
       setSavingModelId(null);
     }
@@ -2542,10 +3415,14 @@ function CustomModelsSection({
             return (
               <div
                 key={model.id}
-                className="flex items-center gap-3 p-3 rounded-lg border border-border hover:bg-sidebar/50"
+                className="flex items-center gap-3 rounded-lg border border-border p-3 hover:bg-sidebar/50"
               >
-                <span className="material-symbols-outlined text-base text-primary">tune</span>
-                <div className="flex-1 min-w-0">
+                {editingModelId !== model.id && (
+                  <span className="material-symbols-outlined text-base text-primary shrink-0">
+                    tune
+                  </span>
+                )}
+                <div className="min-w-0 flex-1">
                   <p className="text-sm font-medium truncate">{model.name || model.id}</p>
                   <div className="flex items-center gap-1 mt-1 flex-wrap">
                     <code className="text-xs text-text-muted font-mono bg-sidebar px-1.5 py-0.5 rounded">
@@ -2596,32 +3473,39 @@ function CustomModelsSection({
                         {t("compatBadgeNoPreserve")}
                       </span>
                     )}
+                    {anyUpstreamHeadersBadge(model.id, customMap, overrideMap) && (
+                      <span
+                        className="text-[10px] px-1.5 py-0.5 rounded-full bg-violet-500/15 text-violet-400 font-medium"
+                        title={t("compatUpstreamHeadersLabel")}
+                      >
+                        {t("compatBadgeUpstreamHeaders")}
+                      </span>
+                    )}
                   </div>
 
                   {editingModelId === model.id && (
-                    <div className="mt-3 p-3 rounded-lg border border-border bg-sidebar/40">
-                      <div className="flex items-end gap-3 flex-wrap">
-                        <div className="w-44">
+                    <div className="mt-3 min-w-0 max-w-full rounded-lg border border-border bg-muted p-3 dark:bg-zinc-900">
+                      <div className="flex min-w-0 flex-wrap items-end gap-x-3 gap-y-2">
+                        <div className="w-[11rem] shrink-0 min-w-0">
                           <label className="text-xs text-text-muted mb-1 block">API Format</label>
                           <select
                             value={editingApiFormat}
                             onChange={(e) => setEditingApiFormat(e.target.value)}
-                            className="w-full px-2.5 py-2 text-xs border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
+                            className="w-full px-2.5 py-2 text-xs border border-border rounded-lg bg-background text-text-main focus:outline-none focus:border-primary"
                           >
                             <option value="chat-completions">Chat Completions</option>
                             <option value="responses">Responses API</option>
                           </select>
                         </div>
-
-                        <div className="flex-1 min-w-[240px]">
-                          <span className="text-xs text-text-muted mb-1 block">
+                        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1 overflow-x-auto overflow-y-visible [scrollbar-width:thin]">
+                          <span className="text-xs text-text-muted shrink-0">
                             Supported Endpoints
                           </span>
-                          <div className="flex items-center gap-3 flex-wrap">
+                          <div className="flex flex-wrap items-center gap-x-2 sm:gap-x-3 gap-y-1 min-w-0">
                             {["chat", "embeddings", "images", "audio"].map((ep) => (
                               <label
                                 key={ep}
-                                className="flex items-center gap-1.5 text-xs text-text-main cursor-pointer"
+                                className="flex items-center gap-1.5 text-xs text-text-main cursor-pointer whitespace-nowrap"
                               >
                                 <input
                                   type="checkbox"
@@ -2648,51 +3532,52 @@ function CustomModelsSection({
                             ))}
                           </div>
                         </div>
-                      </div>
-                      <div className="mt-3 pt-3 border-t border-border/80 w-full">
-                        <ModelCompatPopover
-                          t={t}
-                          effectiveModelNormalize={(p) =>
-                            effectiveNormalizeForProtocol(model.id, p, customMap, overrideMap)
-                          }
-                          effectiveModelPreserveDeveloper={(p) =>
-                            effectivePreserveForProtocol(model.id, p, customMap, overrideMap)
-                          }
-                          onCompatPatch={(protocol, payload) =>
-                            saveCustomCompat(model.id, {
-                              compatByProtocol: { [protocol]: payload },
-                            })
-                          }
-                          showDeveloperToggle
-                          disabled={savingModelId === model.id}
-                        />
-                      </div>
-                      <div className="mt-3 flex items-center gap-2">
-                        <Button
-                          size="sm"
-                          onClick={() => saveEdit(model.id)}
-                          disabled={savingModelId === model.id}
-                        >
-                          {savingModelId === model.id ? t("saving") : t("save")}
-                        </Button>
-                        <Button size="sm" variant="ghost" onClick={cancelEdit}>
-                          {t("cancel")}
-                        </Button>
+                        <div className="flex shrink-0 flex-wrap items-center gap-2 pb-0.5">
+                          <Button
+                            size="sm"
+                            onClick={() => saveEdit(model.id)}
+                            disabled={savingModelId === model.id}
+                          >
+                            {savingModelId === model.id ? t("saving") : t("save")}
+                          </Button>
+                          <Button size="sm" variant="ghost" onClick={cancelEdit}>
+                            {t("cancel")}
+                          </Button>
+                        </div>
                       </div>
                     </div>
                   )}
                 </div>
-                <div className="flex items-center gap-1">
+                <div className="flex shrink-0 items-center gap-1">
                   <button
                     onClick={() => beginEdit(model)}
-                    className="p-1 hover:bg-sidebar rounded text-text-muted hover:text-primary"
+                    className="rounded p-1 text-text-muted hover:bg-sidebar hover:text-primary"
                     title={t("edit")}
                   >
                     <span className="material-symbols-outlined text-sm">edit</span>
                   </button>
+                  <ModelCompatPopover
+                    t={t}
+                    effectiveModelNormalize={(p) =>
+                      effectiveNormalizeForProtocol(model.id, p, customMap, overrideMap)
+                    }
+                    effectiveModelPreserveDeveloper={(p) =>
+                      effectivePreserveForProtocol(model.id, p, customMap, overrideMap)
+                    }
+                    getUpstreamHeadersRecord={(p) =>
+                      effectiveUpstreamHeadersForProtocol(model.id, p, customMap, overrideMap)
+                    }
+                    onCompatPatch={(protocol, payload) =>
+                      saveCustomCompat(model.id, {
+                        compatByProtocol: { [protocol]: payload },
+                      })
+                    }
+                    showDeveloperToggle
+                    disabled={savingModelId === model.id}
+                  />
                   <button
                     onClick={() => handleRemove(model.id)}
-                    className="p-1 hover:bg-red-50 rounded text-red-500"
+                    className="rounded p-1 text-red-500 hover:bg-red-50"
                     title={t("removeCustomModel")}
                   >
                     <span className="material-symbols-outlined text-sm">delete</span>
@@ -2721,6 +3606,10 @@ function CompatibleModelsSection({
   providerStorageAlias,
   providerDisplayAlias,
   modelAliases,
+  fallbackModels = [],
+  description,
+  inputLabel,
+  inputPlaceholder,
   copied,
   onCopy,
   onSetAlias,
@@ -2731,42 +3620,56 @@ function CompatibleModelsSection({
   t,
   effectiveModelNormalize,
   effectiveModelPreserveDeveloper,
+  getUpstreamHeadersRecord,
   saveModelCompatFlags,
   compatSavingModelId,
   onModelsChanged,
+  allowImport,
 }: CompatibleModelsSectionProps) {
   const [newModel, setNewModel] = useState("");
   const [adding, setAdding] = useState(false);
   const [importing, setImporting] = useState(false);
   const notify = useNotificationStore();
 
-  const providerAliases = Object.entries(modelAliases).filter(([, model]: [string, any]) =>
-    (model as string).startsWith(`${providerStorageAlias}/`)
+  const providerAliases = useMemo(
+    () =>
+      Object.entries(modelAliases).filter(([, model]: [string, any]) =>
+        (model as string).startsWith(`${providerStorageAlias}/`)
+      ),
+    [modelAliases, providerStorageAlias]
   );
 
-  const allModels = providerAliases.map(([alias, fullModel]: [string, any]) => ({
-    modelId: (fullModel as string).replace(`${providerStorageAlias}/`, ""),
-    fullModel,
-    alias,
-  }));
+  const allModels = useMemo(() => {
+    const rows = providerAliases.map(([alias, fullModel]: [string, any]) => ({
+      modelId: (fullModel as string).replace(`${providerStorageAlias}/`, ""),
+      alias,
+    }));
 
-  const generateDefaultAlias = (modelId) => {
-    const parts = modelId.split("/");
-    return parts[parts.length - 1];
-  };
+    const seenModelIds = new Set(rows.map((row) => row.modelId));
+    for (const model of fallbackModels) {
+      if (!model?.id || seenModelIds.has(model.id)) continue;
+      rows.push({ modelId: model.id, alias: null });
+      seenModelIds.add(model.id);
+    }
 
-  const resolveAlias = (modelId) => {
-    const baseAlias = generateDefaultAlias(modelId);
-    if (!modelAliases[baseAlias]) return baseAlias;
-    const prefixedAlias = `${providerDisplayAlias}-${baseAlias}`;
-    if (!modelAliases[prefixedAlias]) return prefixedAlias;
-    return null;
-  };
+    return rows;
+  }, [fallbackModels, providerAliases, providerStorageAlias]);
+
+  const resolveAlias = useCallback(
+    (modelId: string, workingAliases: Record<string, string>) =>
+      resolveManagedModelAlias({
+        modelId,
+        fullModel: `${providerStorageAlias}/${modelId}`,
+        providerDisplayAlias,
+        existingAliases: workingAliases,
+      }),
+    [providerDisplayAlias, providerStorageAlias]
+  );
 
   const handleAdd = async () => {
     if (!newModel.trim() || adding) return;
     const modelId = newModel.trim();
-    const resolvedAlias = resolveAlias(modelId);
+    const resolvedAlias = resolveAlias(modelId, modelAliases);
     if (!resolvedAlias) {
       notify.error(t("allSuggestedAliasesExist"));
       return;
@@ -2810,12 +3713,13 @@ function CompatibleModelsSection({
   };
 
   const handleImport = async () => {
-    if (importing) return;
+    if (!allowImport || importing) return;
     const activeConnection = connections.find((conn) => conn.isActive !== false);
     if (!activeConnection) return;
 
     setImporting(true);
     try {
+      const workingAliases = { ...modelAliases };
       await onImportWithProgress(
         // fetchModels callback
         async () => {
@@ -2828,7 +3732,7 @@ function CompatibleModelsSection({
         async (model: any) => {
           const modelId = model.id || model.name || model.model;
           if (!modelId) return false;
-          const resolvedAlias = resolveAlias(modelId);
+          const resolvedAlias = resolveAlias(modelId, workingAliases);
           if (!resolvedAlias) return false;
 
           // Save to customModels DB FIRST - only create alias if this succeeds
@@ -2850,6 +3754,7 @@ function CompatibleModelsSection({
 
           // Only create alias after customModel is saved successfully
           await onSetAlias(modelId, resolvedAlias, providerStorageAlias);
+          workingAliases[resolvedAlias] = `${providerStorageAlias}/${modelId}`;
           return true;
         }
       );
@@ -2864,7 +3769,7 @@ function CompatibleModelsSection({
   const canImport = connections.some((conn) => conn.isActive !== false);
 
   // Handle delete: remove from both alias and customModels DB
-  const handleDeleteModel = async (modelId: string, alias: string) => {
+  const handleDeleteModel = async (modelId: string, alias?: string | null) => {
     try {
       // Remove from customModels DB
       const res = await fetch(
@@ -2875,7 +3780,9 @@ function CompatibleModelsSection({
         throw new Error(t("failedRemoveModelFromDatabase"));
       }
       // Also delete the alias
-      await onDeleteAlias(alias);
+      if (alias) {
+        await onDeleteAlias(alias);
+      }
       notify.success(t("modelRemovedSuccess"));
       onModelsChanged?.();
     } catch (error) {
@@ -2886,11 +3793,7 @@ function CompatibleModelsSection({
 
   return (
     <div className="flex flex-col gap-4">
-      <p className="text-sm text-text-muted">
-        {t("compatibleModelsDescription", {
-          type: isAnthropic ? t("anthropic") : t("openai"),
-        })}
-      </p>
+      <p className="text-sm text-text-muted">{description}</p>
 
       <div className="flex items-end gap-2 flex-wrap">
         <div className="flex-1 min-w-[240px]">
@@ -2898,7 +3801,7 @@ function CompatibleModelsSection({
             htmlFor="new-compatible-model-input"
             className="text-xs text-text-muted mb-1 block"
           >
-            {t("modelId")}
+            {inputLabel}
           </label>
           <input
             id="new-compatible-model-input"
@@ -2906,35 +3809,35 @@ function CompatibleModelsSection({
             value={newModel}
             onChange={(e) => setNewModel(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleAdd()}
-            placeholder={
-              isAnthropic
-                ? t("anthropicCompatibleModelPlaceholder")
-                : t("openaiCompatibleModelPlaceholder")
-            }
+            placeholder={inputPlaceholder}
             className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
           />
         </div>
         <Button size="sm" icon="add" onClick={handleAdd} disabled={!newModel.trim() || adding}>
           {adding ? t("adding") : t("add")}
         </Button>
-        <Button
-          size="sm"
-          variant="secondary"
-          icon="download"
-          onClick={handleImport}
-          disabled={!canImport || importing}
-        >
-          {importing ? t("importingModels") : t("importFromModels")}
-        </Button>
+        {allowImport && (
+          <Button
+            size="sm"
+            variant="secondary"
+            icon="download"
+            onClick={handleImport}
+            disabled={!canImport || importing}
+          >
+            {importing ? t("importingModels") : t("importFromModels")}
+          </Button>
+        )}
       </div>
 
-      {!canImport && <p className="text-xs text-text-muted">{t("addConnectionToImport")}</p>}
+      {allowImport && !canImport && (
+        <p className="text-xs text-text-muted">{t("addConnectionToImport")}</p>
+      )}
 
       {allModels.length > 0 && (
         <div className="flex flex-col gap-3">
-          {allModels.map(({ modelId, fullModel, alias }) => (
+          {allModels.map(({ modelId, alias }) => (
             <PassthroughModelRow
-              key={fullModel as string}
+              key={`${providerStorageAlias}:${modelId}`}
               modelId={modelId}
               fullModel={`${providerDisplayAlias}/${modelId}`}
               copied={copied}
@@ -2944,6 +3847,7 @@ function CompatibleModelsSection({
               showDeveloperToggle={!isAnthropic}
               effectiveModelNormalize={effectiveModelNormalize}
               effectiveModelPreserveDeveloper={effectiveModelPreserveDeveloper}
+              getUpstreamHeadersRecord={(p) => getUpstreamHeadersRecord(modelId, p)}
               saveModelCompatFlags={saveModelCompatFlags}
               compatDisabled={compatSavingModelId === modelId}
             />
@@ -2958,6 +3862,10 @@ CompatibleModelsSection.propTypes = {
   providerStorageAlias: PropTypes.string.isRequired,
   providerDisplayAlias: PropTypes.string.isRequired,
   modelAliases: PropTypes.object.isRequired,
+  fallbackModels: PropTypes.array,
+  description: PropTypes.string.isRequired,
+  inputLabel: PropTypes.string.isRequired,
+  inputPlaceholder: PropTypes.string.isRequired,
   copied: PropTypes.string,
   onCopy: PropTypes.func.isRequired,
   onSetAlias: PropTypes.func.isRequired,
@@ -2973,9 +3881,11 @@ CompatibleModelsSection.propTypes = {
   t: PropTypes.func.isRequired,
   effectiveModelNormalize: PropTypes.func.isRequired,
   effectiveModelPreserveDeveloper: PropTypes.func.isRequired,
+  getUpstreamHeadersRecord: PropTypes.func.isRequired,
   saveModelCompatFlags: PropTypes.func.isRequired,
   compatSavingModelId: PropTypes.string,
   onModelsChanged: PropTypes.func,
+  allowImport: PropTypes.bool.isRequired,
 };
 
 function CooldownTimer({ until }: CooldownTimerProps) {
@@ -3226,11 +4136,23 @@ function ConnectionRow({
   proxyHost,
   onRefreshToken,
   isRefreshing,
+  onApplyCodexAuthLocal,
+  isApplyingCodexAuthLocal,
+  onExportCodexAuthFile,
+  isExportingCodexAuthFile,
 }: ConnectionRowProps) {
   const t = useTranslations("providers");
   const displayName = isOAuth
     ? connection.name || connection.email || connection.displayName || t("oauthAccount")
     : connection.name;
+  const applyCodexAuthLabel =
+    typeof t.has === "function" && t.has("applyCodexAuthLocal")
+      ? t("applyCodexAuthLocal")
+      : "Apply auth";
+  const exportCodexAuthLabel =
+    typeof t.has === "function" && t.has("exportCodexAuthFile")
+      ? t("exportCodexAuthFile")
+      : "Export auth";
 
   // Use useState + useEffect for impure Date.now() to avoid calling during render
   const [isCooldown, setIsCooldown] = useState(false);
@@ -3348,9 +4270,9 @@ function ConnectionRow({
             {connection.lastError && connection.isActive !== false && (
               <span
                 className={`text-xs truncate max-w-[300px] ${statusPresentation.errorTextClass}`}
-                title={connection.lastError}
+                title={connection.lastError.replace(/<[^>]+>/gm, "")}
               >
-                {connection.lastError}
+                {connection.lastError.replace(/<[^>]+>/gm, "")}
               </span>
             )}
             <span className="text-xs text-text-muted">#{connection.priority}</span>
@@ -3465,6 +4387,34 @@ function ConnectionRow({
             Token
           </Button>
         )}
+        {isCodex && onApplyCodexAuthLocal && (
+          <Button
+            size="sm"
+            variant="ghost"
+            icon="download_done"
+            loading={isApplyingCodexAuthLocal}
+            disabled={isApplyingCodexAuthLocal}
+            onClick={onApplyCodexAuthLocal}
+            className="!h-7 !px-2 text-xs text-emerald-500 hover:text-emerald-400"
+            title={applyCodexAuthLabel}
+          >
+            {applyCodexAuthLabel}
+          </Button>
+        )}
+        {isCodex && onExportCodexAuthFile && (
+          <Button
+            size="sm"
+            variant="ghost"
+            icon="download"
+            loading={isExportingCodexAuthFile}
+            disabled={isExportingCodexAuthFile}
+            onClick={onExportCodexAuthFile}
+            className="!h-7 !px-2 text-xs text-sky-500 hover:text-sky-400"
+            title={exportCodexAuthLabel}
+          >
+            {exportCodexAuthLabel}
+          </Button>
+        )}
         <Toggle
           size="sm"
           checked={connection.isActive ?? true}
@@ -3541,6 +4491,10 @@ ConnectionRow.propTypes = {
   onEdit: PropTypes.func.isRequired,
   onDelete: PropTypes.func.isRequired,
   onReauth: PropTypes.func,
+  onApplyCodexAuthLocal: PropTypes.func,
+  isApplyingCodexAuthLocal: PropTypes.bool,
+  onExportCodexAuthFile: PropTypes.func,
+  isExportingCodexAuthFile: PropTypes.bool,
 };
 
 function AddApiKeyModal({
@@ -3549,6 +4503,7 @@ function AddApiKeyModal({
   providerName,
   isCompatible,
   isAnthropic,
+  isCcCompatible,
   onSave,
   onClose,
 }: AddApiKeyModalProps) {
@@ -3557,6 +4512,8 @@ function AddApiKeyModal({
   const defaultBailianUrl = "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1";
   const isVertex = provider === "vertex";
   const defaultRegion = "us-central1";
+  const isGlm = provider === "glm";
+  const isQoder = provider === "qoder";
 
   const [formData, setFormData] = useState({
     name: "",
@@ -3564,6 +4521,7 @@ function AddApiKeyModal({
     priority: 1,
     baseUrl: isBailian ? defaultBailianUrl : "",
     region: isVertex ? defaultRegion : "",
+    apiRegion: "international",
     validationModelId: "",
   });
   const [validating, setValidating] = useState(false);
@@ -3653,6 +4611,10 @@ function AddApiKeyModal({
         payload.providerSpecificData = {
           region: formData.region,
         };
+      } else if (isGlm) {
+        payload.providerSpecificData = {
+          apiRegion: formData.apiRegion,
+        };
       }
 
       const error = await onSave(payload);
@@ -3677,16 +4639,27 @@ function AddApiKeyModal({
           label={t("nameLabel")}
           value={formData.name}
           onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-          placeholder={t("productionKey")}
+          placeholder={isQoder ? "Qoder PAT" : t("productionKey")}
         />
         <div className="flex gap-2">
           <Input
-            label={t("apiKeyLabel")}
+            label={isQoder ? "Personal Access Token" : t("apiKeyLabel")}
             type="password"
             value={formData.apiKey}
             onChange={(e) => setFormData({ ...formData, apiKey: e.target.value })}
             className="flex-1"
-            placeholder={isVertex ? "Cole o Service Account JSON aqui" : undefined}
+            placeholder={
+              isVertex
+                ? "Cole o Service Account JSON aqui"
+                : isQoder
+                  ? "Paste your Qoder Personal Access Token"
+                  : undefined
+            }
+            hint={
+              isQoder
+                ? "Supported path: PAT via qodercli. Browser OAuth remains experimental."
+                : undefined
+            }
           />
           <div className="pt-6">
             <Button
@@ -3710,13 +4683,15 @@ function AddApiKeyModal({
         )}
         {isCompatible && (
           <p className="text-xs text-text-muted">
-            {isAnthropic
-              ? t("validationChecksAnthropicCompatible", {
-                  provider: providerName || t("anthropicCompatibleName"),
-                })
-              : t("validationChecksOpenAiCompatible", {
-                  provider: providerName || t("openaiCompatibleName"),
-                })}
+            {isCcCompatible
+              ? "Validation uses the strict Claude Code-compatible bridge request for this provider."
+              : isAnthropic
+                ? t("validationChecksAnthropicCompatible", {
+                    provider: providerName || t("anthropicCompatibleName"),
+                  })
+                : t("validationChecksOpenAiCompatible", {
+                    provider: providerName || t("openaiCompatibleName"),
+                  })}
           </p>
         )}
         <Input
@@ -3752,6 +4727,22 @@ function AddApiKeyModal({
             hint="ex: us-central1 ou europe-west4. Partner models usam a região global automaticamente."
           />
         )}
+        {isGlm && (
+          <div>
+            <label className="text-sm font-medium text-text-main mb-1 block">API Region</label>
+            <select
+              value={formData.apiRegion}
+              onChange={(e) => setFormData({ ...formData, apiRegion: e.target.value })}
+              className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
+            >
+              <option value="international">International (api.z.ai)</option>
+              <option value="china">China Mainland (open.bigmodel.cn)</option>
+            </select>
+            <p className="text-xs text-text-muted mt-1">
+              Select the endpoint region for API access and quota tracking.
+            </p>
+          </div>
+        )}
         <div className="flex gap-2">
           <Button
             onClick={handleSubmit}
@@ -3775,6 +4766,7 @@ AddApiKeyModal.propTypes = {
   providerName: PropTypes.string,
   isCompatible: PropTypes.bool,
   isAnthropic: PropTypes.bool,
+  isCcCompatible: PropTypes.bool,
   onSave: PropTypes.func.isRequired,
   onClose: PropTypes.func.isRequired,
 };
@@ -3801,7 +4793,9 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
     healthCheckInterval: 60,
     baseUrl: "",
     region: "",
+    apiRegion: "international",
     validationModelId: "",
+    tag: "",
   });
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState(null);
@@ -3815,6 +4809,7 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
   const isBailian = connection?.provider === "bailian-coding-plan";
   const defaultBailianUrl = "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1";
   const isVertex = connection?.provider === "vertex";
+  const isGlm = connection?.provider === "glm";
   const defaultRegion = "us-central1";
 
   useEffect(() => {
@@ -3830,7 +4825,9 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
         healthCheckInterval: connection.healthCheckInterval ?? 60,
         baseUrl: existingBaseUrl || (isBailian ? defaultBailianUrl : ""),
         region: existingRegion || (isVertex ? defaultRegion : ""),
+        apiRegion: (connection.providerSpecificData?.apiRegion as string) || "international",
         validationModelId: (connection.providerSpecificData?.validationModelId as string) || "",
+        tag: (connection.providerSpecificData?.tag as string) || "",
       });
       // Load existing extra keys from providerSpecificData
       const existing = connection.providerSpecificData?.extraApiKeys;
@@ -3840,7 +4837,7 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
       setValidationResult(null);
       setSaveError(null);
     }
-  }, [connection, isBailian]);
+  }, [connection, isBailian, isVertex]);
 
   const handleTest = async () => {
     if (!connection?.provider) return;
@@ -3954,6 +4951,7 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
         updates.providerSpecificData = {
           ...(connection.providerSpecificData || {}),
           extraApiKeys: extraApiKeys.filter((k) => k.trim().length > 0),
+          tag: formData.tag.trim() || undefined,
         };
         if (formData.validationModelId) {
           updates.providerSpecificData.validationModelId = formData.validationModelId;
@@ -3963,7 +4961,15 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
           updates.providerSpecificData.baseUrl = validatedBailianBaseUrl;
         } else if (isVertex) {
           updates.providerSpecificData.region = formData.region;
+        } else if (isGlm) {
+          updates.providerSpecificData.apiRegion = formData.apiRegion;
         }
+      } else {
+        // Also persist tag for OAuth accounts
+        updates.providerSpecificData = {
+          ...(connection.providerSpecificData || {}),
+          tag: formData.tag.trim() || undefined,
+        };
       }
       const error = (await onSave(updates)) as void | unknown;
       if (error) {
@@ -3993,6 +4999,13 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
           value={formData.name}
           onChange={(e) => setFormData({ ...formData, name: e.target.value })}
           placeholder={isOAuth ? t("accountName") : t("productionKey")}
+        />
+        <Input
+          label="Tag / Group"
+          value={formData.tag}
+          onChange={(e) => setFormData({ ...formData, tag: e.target.value })}
+          placeholder="e.g. personal, work, team-a"
+          hint="Used to group accounts in the provider view"
         />
         {isOAuth && connection.email && (
           <div className="bg-sidebar/50 p-3 rounded-lg">
@@ -4082,6 +5095,23 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
             placeholder={defaultRegion}
             hint="ex: us-central1 ou europe-west4. Partner models usam a região global automaticamente."
           />
+        )}
+
+        {isGlm && (
+          <div>
+            <label className="text-sm font-medium text-text-main mb-1 block">API Region</label>
+            <select
+              value={formData.apiRegion}
+              onChange={(e) => setFormData({ ...formData, apiRegion: e.target.value })}
+              className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
+            >
+              <option value="international">International (api.z.ai)</option>
+              <option value="china">China Mainland (open.bigmodel.cn)</option>
+            </select>
+            <p className="text-xs text-text-muted mt-1">
+              Select the endpoint region for API access and quota tracking.
+            </p>
+          </div>
         )}
 
         {/* T07: Extra API Keys for round-robin rotation */}
@@ -4198,6 +5228,7 @@ function EditCompatibleNodeModal({
   onSave,
   onClose,
   isAnthropic,
+  isCcCompatible,
 }: EditCompatibleNodeModalProps) {
   const t = useTranslations("providers");
   const [formData, setFormData] = useState({
@@ -4222,13 +5253,23 @@ function EditCompatibleNodeModal({
         apiType: node.apiType || "chat",
         baseUrl:
           node.baseUrl ||
-          (isAnthropic ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1"),
-        chatPath: node.chatPath || "",
-        modelsPath: node.modelsPath || "",
+          (isCcCompatible
+            ? "https://api.anthropic.com"
+            : isAnthropic
+              ? "https://api.anthropic.com/v1"
+              : "https://api.openai.com/v1"),
+        chatPath: node.chatPath || (isCcCompatible ? CC_COMPATIBLE_DEFAULT_CHAT_PATH : ""),
+        modelsPath: isCcCompatible ? "" : node.modelsPath || "",
       });
-      setShowAdvanced(!!(node.chatPath || node.modelsPath));
+      setShowAdvanced(
+        !!(
+          node.chatPath ||
+          (!isCcCompatible && node.modelsPath) ||
+          (isCcCompatible && !node.chatPath)
+        )
+      );
     }
-  }, [node, isAnthropic]);
+  }, [node, isAnthropic, isCcCompatible]);
 
   const apiTypeOptions = [
     { value: "chat", label: t("chatCompletions") },
@@ -4243,8 +5284,8 @@ function EditCompatibleNodeModal({
         name: formData.name,
         prefix: formData.prefix,
         baseUrl: formData.baseUrl,
-        chatPath: formData.chatPath || "",
-        modelsPath: formData.modelsPath || "",
+        chatPath: formData.chatPath || (isCcCompatible ? CC_COMPATIBLE_DEFAULT_CHAT_PATH : ""),
+        modelsPath: isCcCompatible ? "" : formData.modelsPath,
       };
       if (!isAnthropic) {
         payload.apiType = formData.apiType;
@@ -4265,7 +5306,9 @@ function EditCompatibleNodeModal({
           baseUrl: formData.baseUrl,
           apiKey: checkKey,
           type: isAnthropic ? "anthropic-compatible" : "openai-compatible",
-          modelsPath: formData.modelsPath || "",
+          compatMode: isCcCompatible ? "cc" : undefined,
+          chatPath: formData.chatPath || (isCcCompatible ? CC_COMPATIBLE_DEFAULT_CHAT_PATH : ""),
+          modelsPath: isCcCompatible ? "" : formData.modelsPath,
         }),
       });
       const data = await res.json();
@@ -4282,25 +5325,39 @@ function EditCompatibleNodeModal({
   return (
     <Modal
       isOpen={isOpen}
-      title={t("editCompatibleTitle", { type: isAnthropic ? t("anthropic") : t("openai") })}
+      title={
+        isCcCompatible
+          ? CC_COMPATIBLE_DETAILS_TITLE
+          : t("editCompatibleTitle", { type: isAnthropic ? t("anthropic") : t("openai") })
+      }
       onClose={onClose}
     >
       <div className="flex flex-col gap-4">
         <Input
-          label={t("nameLabel")}
+          label={isCcCompatible ? "Name" : t("nameLabel")}
           value={formData.name}
           onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-          placeholder={t("compatibleProdPlaceholder", {
-            type: isAnthropic ? t("anthropic") : t("openai"),
-          })}
-          hint={t("nameHint")}
+          placeholder={
+            isCcCompatible
+              ? "CC Compatible Production"
+              : t("compatibleProdPlaceholder", {
+                  type: isAnthropic ? t("anthropic") : t("openai"),
+                })
+          }
+          hint={isCcCompatible ? "Display name for this provider" : t("nameHint")}
         />
         <Input
-          label={t("prefixLabel")}
+          label={isCcCompatible ? "Prefix" : t("prefixLabel")}
           value={formData.prefix}
           onChange={(e) => setFormData({ ...formData, prefix: e.target.value })}
-          placeholder={isAnthropic ? t("anthropicPrefixPlaceholder") : t("openaiPrefixPlaceholder")}
-          hint={t("prefixHint")}
+          placeholder={
+            isCcCompatible
+              ? "cc"
+              : isAnthropic
+                ? t("anthropicPrefixPlaceholder")
+                : t("openaiPrefixPlaceholder")
+          }
+          hint={isCcCompatible ? "Used for aliases such as prefix/model-id" : t("prefixHint")}
         />
         {!isAnthropic && (
           <Select
@@ -4311,15 +5368,23 @@ function EditCompatibleNodeModal({
           />
         )}
         <Input
-          label={t("baseUrlLabel")}
+          label={isCcCompatible ? "Base URL" : t("baseUrlLabel")}
           value={formData.baseUrl}
           onChange={(e) => setFormData({ ...formData, baseUrl: e.target.value })}
           placeholder={
-            isAnthropic ? t("anthropicBaseUrlPlaceholder") : t("openaiBaseUrlPlaceholder")
+            isCcCompatible
+              ? "https://example.com/v1"
+              : isAnthropic
+                ? t("anthropicBaseUrlPlaceholder")
+                : t("openaiBaseUrlPlaceholder")
           }
-          hint={t("compatibleBaseUrlHint", {
-            type: isAnthropic ? t("anthropic") : t("openai"),
-          })}
+          hint={
+            isCcCompatible
+              ? "Base URL for the CC-compatible site. Do not include /messages."
+              : t("compatibleBaseUrlHint", {
+                  type: isAnthropic ? t("anthropic") : t("openai"),
+                })
+          }
         />
         <button
           type="button"
@@ -4339,19 +5404,31 @@ function EditCompatibleNodeModal({
         {showAdvanced && (
           <div id="advanced-settings" className="flex flex-col gap-3 pl-2 border-l-2 border-border">
             <Input
-              label={t("chatPathLabel")}
+              label={isCcCompatible ? "Chat Path" : t("chatPathLabel")}
               value={formData.chatPath}
               onChange={(e) => setFormData({ ...formData, chatPath: e.target.value })}
-              placeholder={isAnthropic ? "/messages" : t("chatPathPlaceholder")}
-              hint={t("chatPathHint")}
+              placeholder={
+                isCcCompatible
+                  ? CC_COMPATIBLE_DEFAULT_CHAT_PATH
+                  : isAnthropic
+                    ? "/messages"
+                    : t("chatPathPlaceholder")
+              }
+              hint={
+                isCcCompatible
+                  ? "Defaults to the strict Claude Code-compatible messages path"
+                  : t("chatPathHint")
+              }
             />
-            <Input
-              label={t("modelsPathLabel")}
-              value={formData.modelsPath}
-              onChange={(e) => setFormData({ ...formData, modelsPath: e.target.value })}
-              placeholder={t("modelsPathPlaceholder")}
-              hint={t("modelsPathHint")}
-            />
+            {!isCcCompatible && (
+              <Input
+                label={t("modelsPathLabel")}
+                value={formData.modelsPath}
+                onChange={(e) => setFormData({ ...formData, modelsPath: e.target.value })}
+                placeholder={t("modelsPathPlaceholder")}
+                hint={t("modelsPathHint")}
+              />
+            )}
           </div>
         )}
         <div className="flex gap-2">
@@ -4410,4 +5487,5 @@ EditCompatibleNodeModal.propTypes = {
   onSave: PropTypes.func.isRequired,
   onClose: PropTypes.func.isRequired,
   isAnthropic: PropTypes.bool,
+  isCcCompatible: PropTypes.bool,
 };

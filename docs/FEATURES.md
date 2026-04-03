@@ -8,7 +8,7 @@ Visual guide to every section of the OmniRoute dashboard.
 
 ## 🔌 Providers
 
-Manage AI provider connections: OAuth providers (Claude Code, Codex, Gemini CLI), API key providers (Groq, DeepSeek, OpenRouter), and free providers (iFlow, Qwen, Kiro). Kiro accounts include credit balance tracking — remaining credits, total allowance, and renewal date visible in Dashboard → Usage.
+Manage AI provider connections: OAuth providers (Claude Code, Codex, Gemini CLI), API key providers (Groq, DeepSeek, OpenRouter), and free providers (Qoder, Qwen, Kiro). Kiro accounts include credit balance tracking — remaining credits, total allowance, and renewal date visible in Dashboard → Usage.
 
 ![Providers Dashboard](screenshots/01-providers.png)
 
@@ -63,11 +63,11 @@ Customizable color themes for the entire dashboard. Choose from 7 preset colors 
 Comprehensive settings panel with tabs:
 
 - **General** — System storage, backup management (export/import database)
-- **Appearance** — Theme selector (dark/light/system), color theme presets and custom colors, health log visibility
+- **Appearance** — Theme selector (dark/light/system), color theme presets and custom colors, health log visibility, sidebar item visibility controls
 - **Security** — API endpoint protection, custom provider blocking, IP filtering, session info
 - **Routing** — Model aliases, background task degradation
-- **Resilience** — Rate limit persistence, circuit breaker tuning
-- **Advanced** — Configuration overrides
+- **Resilience** — Rate limit persistence, circuit breaker tuning, auto-disable banned accounts, provider expiration monitoring
+- **Advanced** — Configuration overrides, configuration audit trail, fallback degradation mode
 
 ![Settings Dashboard](screenshots/06-settings.png)
 
@@ -108,7 +108,7 @@ Real-time request logging with filtering by provider, model, account, and API ke
 
 ## 🌐 API Endpoint
 
-Your unified API endpoint with capability breakdown: Chat Completions, Responses API, Embeddings, Image Generation, Reranking, Audio Transcription, Text-to-Speech, Moderations, and registered API keys. Cloud proxy support for remote access.
+Your unified API endpoint with capability breakdown: Chat Completions, Responses API, Embeddings, Image Generation, Reranking, Audio Transcription, Text-to-Speech, Moderations, and registered API keys. Cloudflare Quick Tunnel integration and cloud proxy support for remote access.
 
 ![Endpoint Dashboard](screenshots/09-endpoint.png)
 

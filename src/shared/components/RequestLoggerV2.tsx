@@ -93,6 +93,8 @@ export default function RequestLoggerV2() {
   const [selectedLog, setSelectedLog] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailData, setDetailData] = useState(null);
+  const [detailLoggingEnabled, setDetailLoggingEnabled] = useState(false);
+  const [detailLoggingLoading, setDetailLoggingLoading] = useState(false);
   const intervalRef = useRef(null);
   const hasLoadedRef = useRef(false);
   const [providerNodes, setProviderNodes] = useState([]);
@@ -158,6 +160,19 @@ export default function RequestLoggerV2() {
     fetch("/api/provider-nodes")
       .then((r) => (r.ok ? r.json() : { nodes: [] }))
       .then((d) => setProviderNodes(d.nodes || []))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    fetch("/api/logs/detail?limit=1")
+      .then(async (res) => {
+        if (!res.ok) return null;
+        return await res.json();
+      })
+      .then((data) => {
+        if (!data) return;
+        setDetailLoggingEnabled(data.enabled === true);
+      })
       .catch(() => {});
   }, []);
 
@@ -232,6 +247,24 @@ export default function RequestLoggerV2() {
     setDetailData(null);
   };
 
+  const toggleDetailLogging = async () => {
+    setDetailLoggingLoading(true);
+    try {
+      const nextEnabled = !detailLoggingEnabled;
+      const res = await fetch("/api/logs/detail", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: nextEnabled }),
+      });
+      if (!res.ok) throw new Error("Failed to update pipeline logging");
+      setDetailLoggingEnabled(nextEnabled);
+    } catch (error) {
+      console.error("Failed to toggle pipeline logging:", error);
+    } finally {
+      setDetailLoggingLoading(false);
+    }
+  };
+
   // Unique accounts and providers for dropdowns
 
   const uniqueAccounts = [...new Set(logs.map((l) => l.account).filter((a) => a && a !== "-"))];
@@ -269,6 +302,26 @@ export default function RequestLoggerV2() {
             className={`w-2 h-2 rounded-full ${recording ? "bg-red-500 animate-pulse" : "bg-text-muted"}`}
           />
           {recording ? "Recording" : "Paused"}
+        </button>
+
+        <button
+          onClick={toggleDetailLogging}
+          disabled={detailLoggingLoading}
+          className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium border transition-colors disabled:opacity-60 ${
+            detailLoggingEnabled
+              ? "bg-amber-500/10 border-amber-500/30 text-amber-700 dark:text-amber-300"
+              : "bg-bg-subtle border-border text-text-muted"
+          }`}
+          title="Capture pipeline payloads for new requests"
+        >
+          <span
+            className={`w-2 h-2 rounded-full ${detailLoggingEnabled ? "bg-amber-500" : "bg-text-muted"}`}
+          />
+          {detailLoggingLoading
+            ? "Updating pipeline logs..."
+            : detailLoggingEnabled
+              ? "Pipeline Logs On"
+              : "Pipeline Logs Off"}
         </button>
 
         {/* Search */}
@@ -706,8 +759,8 @@ export default function RequestLoggerV2() {
       </Card>
 
       <div className="text-[10px] text-text-muted italic">
-        Call logs are also saved as JSON files to <code>{`{DATA_DIR}/call_logs/`}</code> with 7-day
-        rotation.
+        Call logs are also saved as JSON files to <code>{`{DATA_DIR}/call_logs/`}</code> and rotated
+        by <code>CALL_LOG_RETENTION_DAYS</code> and <code>CALL_LOG_MAX_ENTRIES</code>.
       </div>
 
       {/* Detail Modal */}

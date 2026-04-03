@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { HIDEABLE_SIDEBAR_ITEM_IDS } from "@/shared/constants/sidebarVisibility";
+import { isForbiddenUpstreamHeaderName } from "@/shared/constants/upstreamHeaders";
 
 function isHttpUrl(value: string): boolean {
   try {
@@ -77,6 +79,9 @@ const comboStrategySchema = z.enum([
   "cost-optimized",
   "strict-random",
   "auto",
+  "fill-first",
+  // #729 schema fixes for combo edit/save
+  "p2c",
 ]);
 
 const comboRuntimeConfigSchema = z
@@ -107,6 +112,7 @@ export const createComboSchema = z.object({
   system_message: z.string().max(50000).optional(),
   tool_filter_regex: z.string().max(1000).optional(),
   context_cache_protection: z.boolean().optional(),
+  context_length: z.number().int().min(1000).max(2000000).optional(),
 });
 
 // ──── Auto-Combo Schemas ────
@@ -142,17 +148,16 @@ export const updateSettingsSchema = z.object({
   theme: z.string().max(50).optional(),
   language: z.string().max(10).optional(),
   requireLogin: z.boolean().optional(),
-  enableRequestLogs: z.boolean().optional(),
   enableSocks5Proxy: z.boolean().optional(),
   instanceName: z.string().max(100).optional(),
   corsOrigins: z.string().max(500).optional(),
-  logRetentionDays: z.number().int().min(1).max(365).optional(),
   cloudUrl: z.string().max(500).optional(),
   baseUrl: z.string().max(500).optional(),
   setupComplete: z.boolean().optional(),
   requireAuthForModels: z.boolean().optional(),
   blockedProviders: z.array(z.string().max(100)).optional(),
   hideHealthCheckLogs: z.boolean().optional(),
+  hiddenSidebarItems: z.array(z.enum(HIDEABLE_SIDEBAR_ITEM_IDS)).optional(),
   // Routing settings (#134)
   fallbackStrategy: z
     .enum([
@@ -340,10 +345,34 @@ export const clearModelAvailabilitySchema = z.object({
   model: modelIdSchema,
 });
 
+/** Align with `sanitizeUpstreamHeadersMap` — allow non-ASCII names; reject Host / hop-by-hop / whitespace / ":". */
+const upstreamHeaderNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(128)
+  .refine((s) => !/[\r\n\0]/.test(s), { message: "header name cannot contain control characters" })
+  .refine((s) => !/\s/.test(s), { message: "header name cannot contain whitespace" })
+  .refine((s) => !s.includes(":"), { message: "header name cannot contain ':'" })
+  .refine((s) => !isForbiddenUpstreamHeaderName(s), { message: "header name is not allowed" });
+
+const upstreamHeaderValueSchema = z
+  .string()
+  .max(4096)
+  .refine((s) => !/[\r\n]/.test(s), { message: "header value cannot contain line breaks" });
+
+const upstreamHeadersRecordSchema = z
+  .record(upstreamHeaderNameSchema, upstreamHeaderValueSchema)
+  .refine((rec) => Object.keys(rec).length <= 16, { message: "at most 16 custom headers" })
+  .refine((rec) => !Object.keys(rec).some((k) => isForbiddenUpstreamHeaderName(k)), {
+    message: "forbidden header name in record",
+  });
+
 const modelCompatPerProtocolSchema = z
   .object({
     normalizeToolCallId: z.boolean().optional(),
     preserveOpenAIDeveloperRole: z.boolean().optional(),
+    upstreamHeaders: upstreamHeadersRecordSchema.optional(),
   })
   .strict();
 
@@ -356,8 +385,10 @@ export const providerModelMutationSchema = z.object({
   supportedEndpoints: z.array(z.enum(["chat", "embeddings", "images", "audio"])).default(["chat"]),
   normalizeToolCallId: z.boolean().optional(),
   preserveOpenAIDeveloperRole: z.boolean().nullable().optional(),
+  upstreamHeaders: upstreamHeadersRecordSchema.nullable().optional(),
+  /** Zod 4: `z.record(z.enum([...]), …)` requires every enum key; use `partialRecord` for sparse patches. */
   compatByProtocol: z
-    .record(z.enum(["openai", "openai-responses", "claude"]), modelCompatPerProtocolSchema)
+    .partialRecord(z.enum(["openai", "openai-responses", "claude"]), modelCompatPerProtocolSchema)
     .optional(),
 });
 
@@ -736,7 +767,6 @@ const nonEmptyJsonRecordSchema = jsonRecordSchema.refine(
 
 const translatorLogFileSchema = z.enum([
   "1_req_client.json",
-  "2_req_source.json",
   "3_req_openai.json",
   "4_req_target.json",
   "5_res_provider.txt",
@@ -855,6 +885,7 @@ export const updateComboSchema = z
     system_message: z.string().max(50000).optional(),
     tool_filter_regex: z.string().max(1000).optional(),
     context_cache_protection: z.boolean().optional(),
+    context_length: z.number().int().min(1000).max(2000000).optional(),
   })
   .superRefine((value, ctx) => {
     if (
@@ -866,7 +897,8 @@ export const updateComboSchema = z
       value.allowedProviders === undefined &&
       value.system_message === undefined &&
       value.tool_filter_regex === undefined &&
-      value.context_cache_protection === undefined
+      value.context_cache_protection === undefined &&
+      value.context_length === undefined
     ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -934,6 +966,7 @@ export const createProviderNodeSchema = z
     apiType: z.enum(["chat", "responses"]).optional(),
     baseUrl: z.string().trim().min(1).optional(),
     type: z.enum(["openai-compatible", "anthropic-compatible"]).optional(),
+    compatMode: z.enum(["cc"]).optional(),
     chatPath: z.string().trim().startsWith("/").max(500).optional().or(z.literal("")),
     modelsPath: z.string().trim().startsWith("/").max(500).optional().or(z.literal("")),
   })
@@ -961,6 +994,8 @@ export const providerNodeValidateSchema = z.object({
   baseUrl: z.string().trim().min(1, "Base URL and API key required"),
   apiKey: z.string().trim().min(1, "Base URL and API key required"),
   type: z.enum(["openai-compatible", "anthropic-compatible"]).optional(),
+  compatMode: z.enum(["cc"]).optional(),
+  chatPath: z.string().trim().startsWith("/").max(500).optional().or(z.literal("")),
   modelsPath: z.string().trim().startsWith("/").max(500).optional().or(z.literal("")),
 });
 
@@ -1276,4 +1311,20 @@ export const v1SearchResponseSchema = z.object({
       })
     )
     .optional(),
+});
+
+// ─── Auto-disable banned/error accounts ───────────────────────────────────
+export const updateAutoDisableAccountsSchema = z
+  .object({
+    enabled: z.boolean(),
+    threshold: z.number().int().min(1).max(10).optional(),
+  })
+  .strict();
+
+export const versionManagerToolSchema = z.object({
+  tool: z.string().trim().min(1),
+});
+
+export const versionManagerInstallSchema = versionManagerToolSchema.extend({
+  version: z.string().trim().optional(),
 });

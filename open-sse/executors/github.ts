@@ -7,6 +7,18 @@ export class GithubExecutor extends BaseExecutor {
     super("github", PROVIDERS.github);
   }
 
+  getCopilotToken(credentials) {
+    return credentials?.copilotToken || credentials?.providerSpecificData?.copilotToken || null;
+  }
+
+  getCopilotTokenExpiresAt(credentials) {
+    return (
+      credentials?.copilotTokenExpiresAt ||
+      credentials?.providerSpecificData?.copilotTokenExpiresAt ||
+      null
+    );
+  }
+
   buildUrl(model, stream, urlIndex = 0) {
     const targetFormat = getModelTargetFormat("gh", model);
     if (targetFormat === "openai-responses") {
@@ -55,15 +67,47 @@ export class GithubExecutor extends BaseExecutor {
       );
       delete modifiedBody.response_format;
     }
+
+    // Strip reasoning_text / reasoning_content from assistant messages.
+    // GitHub Copilot converts these into Anthropic thinking blocks but cannot
+    // supply a valid `signature`, causing upstream 400 errors.
+    if (Array.isArray(modifiedBody.messages)) {
+      for (const msg of modifiedBody.messages) {
+        if (msg.role === "assistant") {
+          delete msg.reasoning_text;
+          delete msg.reasoning_content;
+        }
+      }
+    }
+
     return modifiedBody;
   }
 
   async execute(input: ExecuteInput) {
     const result = await super.execute(input);
-    if (!result || !result.response?.body) return result;
+    if (!result || !result.response) return result;
+
+    if (!input.stream) {
+      // wreq-js clone/text semantics consume the original response body. Materialize
+      // non-streaming responses immediately so downstream code always sees a native
+      // fetch Response with a readable body.
+      const status = result.response.status;
+      const statusText = result.response.statusText;
+      const headers = new Headers(result.response.headers);
+      const payload = await result.response.text();
+      result.response = new Response(payload, { status, statusText, headers });
+      return result;
+    }
+
+    if (!result.response.body) return result;
 
     const isStreaming = input.stream === true;
-    if (isStreaming) {
+    const contentType = (result.response.headers.get("content-type") || "").toLowerCase();
+    if (isStreaming && result.response.ok && contentType.includes("text/event-stream")) {
+      // Preserve the original response body for downstream error handling.
+      const sourceResponse = result.response.clone();
+      if (!sourceResponse.body) return result;
+
       const decoder = new TextDecoder();
       const transformStream = new TransformStream({
         transform(chunk, controller) {
@@ -75,10 +119,10 @@ export class GithubExecutor extends BaseExecutor {
         },
       });
 
-      const newResponse = new Response(result.response.body.pipeThrough(transformStream), {
-        status: result.response.status,
-        statusText: result.response.statusText,
-        headers: result.response.headers, // Headers class carries over correctly
+      const newResponse = new Response(sourceResponse.body.pipeThrough(transformStream), {
+        status: sourceResponse.status,
+        statusText: sourceResponse.statusText,
+        headers: new Headers(sourceResponse.headers),
       });
       result.response = newResponse;
     }
@@ -87,7 +131,7 @@ export class GithubExecutor extends BaseExecutor {
   }
 
   buildHeaders(credentials, stream = true) {
-    const token = credentials.copilotToken || credentials.accessToken;
+    const token = this.getCopilotToken(credentials) || credentials.accessToken;
     return {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
@@ -167,6 +211,10 @@ export class GithubExecutor extends BaseExecutor {
             ...githubTokens,
             copilotToken: copilotResult.token,
             copilotTokenExpiresAt: copilotResult.expiresAt,
+            providerSpecificData: {
+              copilotToken: copilotResult.token,
+              copilotTokenExpiresAt: copilotResult.expiresAt,
+            },
           };
         }
         return githubTokens;
@@ -179,6 +227,10 @@ export class GithubExecutor extends BaseExecutor {
         refreshToken: credentials.refreshToken,
         copilotToken: copilotResult.token,
         copilotTokenExpiresAt: copilotResult.expiresAt,
+        providerSpecificData: {
+          copilotToken: copilotResult.token,
+          copilotTokenExpiresAt: copilotResult.expiresAt,
+        },
       };
     }
 
@@ -187,11 +239,12 @@ export class GithubExecutor extends BaseExecutor {
 
   needsRefresh(credentials) {
     // Always refresh if no copilotToken
-    if (!credentials.copilotToken) return true;
+    if (!this.getCopilotToken(credentials)) return true;
 
-    if (credentials.copilotTokenExpiresAt) {
+    const copilotTokenExpiresAt = this.getCopilotTokenExpiresAt(credentials);
+    if (copilotTokenExpiresAt) {
       // Handle both Unix timestamp (seconds) and ISO string
-      let expiresAtMs = credentials.copilotTokenExpiresAt;
+      let expiresAtMs = copilotTokenExpiresAt;
       if (typeof expiresAtMs === "number" && expiresAtMs < 1e12) {
         expiresAtMs = expiresAtMs * 1000; // Convert seconds to ms
       } else if (typeof expiresAtMs === "string") {

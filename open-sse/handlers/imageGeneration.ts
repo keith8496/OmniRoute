@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 /**
  * Image Generation Handler
  *
@@ -992,7 +993,7 @@ async function handleComfyUIImageGeneration({ model, provider, providerConfig, b
     "3": {
       class_type: "KSampler",
       inputs: {
-        seed: Math.floor(Math.random() * 2 ** 32),
+        seed: parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) % 2 ** 32,
         steps: body.steps || 20,
         cfg: body.cfg_scale || 7,
         sampler_name: "euler",
@@ -1081,6 +1082,24 @@ async function handleComfyUIImageGeneration({ model, provider, providerConfig, b
   }
 }
 
+type Imagen3ImageGenArgs = {
+  model: string;
+  provider: string;
+  providerConfig: { baseUrl: string };
+  body: { prompt?: string; size?: string; n?: number };
+  credentials: { apiKey?: string; accessToken?: string };
+  log?: {
+    info?: (tag: string, msg: string) => void;
+    error?: (tag: string, msg: string) => void;
+  } | null;
+};
+
+type Imagen3NormalizedImage = {
+  b64_json?: unknown;
+  url?: unknown;
+  revised_prompt?: string;
+};
+
 /**
  * Handle Imagen 3 image generation
  */
@@ -1091,7 +1110,7 @@ async function handleImagen3ImageGeneration({
   body,
   credentials,
   log,
-}: any) {
+}: Imagen3ImageGenArgs) {
   const startTime = Date.now();
   const token = credentials.apiKey || credentials.accessToken;
   const aspectRatio = mapImageSize(body.size);
@@ -1142,11 +1161,11 @@ async function handleImagen3ImageGeneration({
     const data = await response.json();
 
     // Normalize response to OpenAI format
-    const images: any[] = [];
+    const images: Imagen3NormalizedImage[] = [];
     if (Array.isArray(data.images)) {
       images.push(
-        ...data.images.map((img: any) => ({
-          b64_json: img.image || img.b64_json || img.url || img,
+        ...data.images.map((img: Record<string, unknown>) => ({
+          b64_json: img.image ?? img.b64_json ?? img.url ?? img,
           revised_prompt: body.prompt,
         }))
       );
@@ -1174,8 +1193,9 @@ async function handleImagen3ImageGeneration({
       success: true,
       data: { created: data.created || Math.floor(Date.now() / 1000), data: images },
     };
-  } catch (err: any) {
-    if (log) log.error("IMAGE", `${provider} fetch error: ${err.message}`);
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (log) log.error("IMAGE", `${provider} fetch error: ${errMsg}`);
 
     saveCallLog({
       method: "POST",
@@ -1184,9 +1204,9 @@ async function handleImagen3ImageGeneration({
       model: `${provider}/${model}`,
       provider,
       duration: Date.now() - startTime,
-      error: err.message,
+      error: errMsg,
     }).catch(() => {});
 
-    return { success: false, status: 502, error: `Image provider error: ${err.message}` };
+    return { success: false, status: 502, error: `Image provider error: ${errMsg}` };
   }
 }

@@ -240,7 +240,7 @@ if (existsSync(mitmSrc)) {
   writeFileSync(tmpTsconfigPath, JSON.stringify(mitmTsconfig, null, 2));
 
   try {
-    execSync(`npx tsc -p ${tmpTsconfigPath}`, { cwd: ROOT, stdio: "inherit" });
+    execSync("npx tsc -p tsconfig.mitm.tmp.json", { cwd: ROOT, stdio: "inherit" });
     console.log("  ✅ MITM utilities compiled to app/src/mitm/");
   } catch (err) {
     console.warn("  ⚠️  MITM compile warning (non-fatal):", err.message);
@@ -251,6 +251,25 @@ if (existsSync(mitmSrc)) {
     try {
       rmSync(tmpTsconfigPath);
     } catch {}
+  }
+}
+
+// ── Step 8.5: Bundle MCP server ────────────────────────────
+const mcpSrcFile = join(ROOT, "open-sse", "mcp-server", "server.ts");
+const mcpDestDir = join(APP_DIR, "open-sse", "mcp-server");
+const mcpDestFile = join(mcpDestDir, "server.js");
+
+if (existsSync(mcpSrcFile)) {
+  console.log("  🔨 Bundling MCP Server (TypeScript → JavaScript)...");
+  mkdirSync(mcpDestDir, { recursive: true });
+  try {
+    execSync(
+      `npx esbuild open-sse/mcp-server/server.ts --bundle --platform=node --packages=external --format=esm --outfile=app/open-sse/mcp-server/server.js`,
+      { cwd: ROOT, stdio: "inherit" }
+    );
+    console.log("  ✅ MCP Server bundled to app/open-sse/mcp-server/server.js");
+  } catch (err) {
+    console.warn("  ⚠️  MCP Server bundle error:", err.message);
   }
 }
 

@@ -17,6 +17,10 @@ export const ACCOUNT_DEACTIVATED_SIGNALS = [
   "account has been disabled",
   "your account has been suspended",
   "this account is deactivated",
+  // AG (Antigravity/Google Cloud Code) permanent ban signals
+  "verify your account to continue",
+  "this service has been disabled in this account for violation",
+  "this service has been disabled in this account",
 ];
 
 // T10 (sub2api PR #1169): Signals that indicate billing credits are exhausted.
@@ -96,11 +100,47 @@ export function lockModel(provider, connectionId, model, reason, cooldownMs) {
   if (!model) return; // No model → skip model-level locking
   ensureCleanupTimer();
   const key = `${provider}:${connectionId}:${model}`;
+  const newUntil = Date.now() + cooldownMs;
+  // Preserve the longer cooldown if an existing lock has more time remaining.
+  // Safe without a mutex: no await between get/set, so this runs atomically
+  // within Node.js's single-threaded event loop.
+  const existing = modelLockouts.get(key);
+  if (existing && existing.until > newUntil) return;
   modelLockouts.set(key, {
     reason,
-    until: Date.now() + cooldownMs,
+    until: newUntil,
     lockedAt: Date.now(),
   });
+}
+
+/**
+ * Whether a provider should use per-model lockouts instead of connection-wide cooldowns.
+ * Gemini AI Studio has per-model quotas; passthrough providers have independent model limits.
+ */
+export function hasPerModelQuota(provider: string): boolean {
+  if (provider === "gemini") return true;
+  try {
+    const { getPassthroughProviders } = require("../config/providerRegistry.ts");
+    return getPassthroughProviders().has(provider);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Lock a model (not connection) for a provider with per-model quotas.
+ * No-ops for providers that don't use per-model lockouts.
+ */
+export function lockModelIfPerModelQuota(
+  provider: string,
+  connectionId: string,
+  model: string | null,
+  reason: string,
+  cooldownMs: number
+): boolean {
+  if (!hasPerModelQuota(provider) || !model) return false;
+  lockModel(provider, connectionId, model, reason, cooldownMs);
+  return true;
 }
 
 /**
@@ -225,6 +265,39 @@ function parseDelayString(value) {
   return isNaN(num) ? null : num * 1000;
 }
 
+/**
+ * T07: Parse retry time from error text body with combined "XhYmZs" format.
+ * Examples: "Your quota will reset after 2h30m14s", "reset after 45m", "reset after 30s"
+ * Returns milliseconds or null if not parseable.
+ *
+ * @param {string} errorText - Error message text from response body
+ * @returns {number|null} Retry duration in milliseconds
+ */
+export function parseRetryFromErrorText(errorText) {
+  if (!errorText || typeof errorText !== "string") return null;
+
+  const match = errorText.match(/reset after (\d+h)?(\d+m)?(\d+s)?/i);
+  if (!match) {
+    // Also try the variant without "reset after": "will reset after XhYmZs"
+    const altMatch = errorText.match(/will reset after (\d+h)?(\d+m)?(\d+s)?/i);
+    if (!altMatch) return null;
+    return computeDurationMs(altMatch);
+  }
+
+  return computeDurationMs(match);
+}
+
+/**
+ * Compute total milliseconds from regex match groups (Xh)(Ym)(Zs)
+ */
+function computeDurationMs(match) {
+  let totalMs = 0;
+  if (match[1]) totalMs += parseInt(match[1], 10) * 3600 * 1000; // hours
+  if (match[2]) totalMs += parseInt(match[2], 10) * 60 * 1000; // minutes
+  if (match[3]) totalMs += parseInt(match[3], 10) * 1000; // seconds
+  return totalMs > 0 ? totalMs : null;
+}
+
 // ─── Error Classification ───────────────────────────────────────────────────
 
 /**
@@ -237,6 +310,8 @@ export function classifyErrorText(errorText) {
   if (
     lower.includes("quota exceeded") ||
     lower.includes("quota depleted") ||
+    lower.includes("quota will reset") ||
+    lower.includes("your quota will reset") ||
     lower.includes("billing")
   ) {
     return RateLimitReason.QUOTA_EXHAUSTED;
@@ -424,6 +499,9 @@ export function checkFallbackError(
       lowerError.includes("rate limit") ||
       lowerError.includes("too many requests") ||
       lowerError.includes("quota exceeded") ||
+      lowerError.includes("quota will reset") ||
+      lowerError.includes("exhausted your capacity") ||
+      lowerError.includes("quota exhausted") ||
       lowerError.includes("capacity") ||
       lowerError.includes("overloaded")
     ) {
@@ -438,6 +516,15 @@ export function checkFallbackError(
             reason: RateLimitReason.RATE_LIMIT_EXCEEDED,
           };
         }
+      }
+      const retryFromBody = parseRetryFromErrorText(errorStr);
+      if (retryFromBody && retryFromBody > 60_000) {
+        return {
+          shouldFallback: true,
+          cooldownMs: retryFromBody,
+          newBackoffLevel: 0,
+          reason: RateLimitReason.RATE_LIMIT_EXCEEDED,
+        };
       }
       const newLevel = Math.min(backoffLevel + 1, BACKOFF_CONFIG.maxLevel);
       const reason = classifyErrorText(errorStr);

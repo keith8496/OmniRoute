@@ -1,6 +1,72 @@
 import { getModelsByProviderId } from "@omniroute/open-sse/config/providerModels.ts";
 import { safePercentage } from "@/shared/utils/formatting";
 
+const PROVIDER_PLAN_FALLBACKS = new Set([
+  "claude code",
+  "kimi coding",
+  "kiro",
+  "openai codex",
+  "codex",
+  "github copilot",
+]);
+
+const QUOTA_LABEL_MAP: Record<string, string> = {
+  chat: "Chat",
+  completions: "Completions",
+  premium_interactions: "Premium",
+  session: "Session",
+  weekly: "Weekly",
+  code_review: "Code Review",
+  agentic_request: "Agentic",
+  agentic_request_freetrial: "Agentic (Trial)",
+};
+
+function toRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function normalizePlanCandidate(value: unknown) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.toLowerCase() === "unknown") return null;
+  if (PROVIDER_PLAN_FALLBACKS.has(trimmed.toLowerCase())) return null;
+  return trimmed;
+}
+
+function toTitleCaseWords(value: string) {
+  return value
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+export function formatQuotaLabel(name: string) {
+  const trimmed = typeof name === "string" ? name.trim() : "";
+  if (!trimmed) return "";
+
+  const mapped = QUOTA_LABEL_MAP[trimmed];
+  if (mapped) return mapped;
+
+  if (/^session\s*\(\d+[hm]\)$/i.test(trimmed)) {
+    return "Session";
+  }
+
+  if (/^weekly\s*\(\d+d\)$/i.test(trimmed)) {
+    return "Weekly";
+  }
+
+  const weeklyModelMatch = trimmed.match(/^weekly\s+(.+?)\s*\(\d+d\)$/i);
+  if (weeklyModelMatch) {
+    return `Weekly ${toTitleCaseWords(weeklyModelMatch[1])}`;
+  }
+
+  return trimmed;
+}
+
 /**
  * Format ISO date string to countdown format (inspired by vscode-antigravity-cockpit)
  * @param {string|Date} date - ISO date string or Date object
@@ -137,9 +203,12 @@ export function parseQuotaData(provider, data) {
       case "antigravity":
         if (data.quotas) {
           Object.entries(data.quotas).forEach(([modelKey, quota]: [string, any]) => {
+            if (quota?.unlimited && (!quota?.total || quota.total <= 0)) {
+              return;
+            }
             normalizedQuotas.push(
-              normalizeQuotaEntry(quota.displayName || modelKey, quota, {
-                modelKey: modelKey, // Keep modelKey for sorting
+              normalizeQuotaEntry(modelKey, quota, {
+                modelKey: modelKey,
               })
             );
           });
@@ -179,6 +248,14 @@ export function parseQuotaData(provider, data) {
         }
         break;
 
+      case "gemini-cli":
+        if (data.quotas) {
+          Object.entries(data.quotas).forEach(([modelKey, quota]: [string, any]) => {
+            normalizedQuotas.push(normalizeQuotaEntry(modelKey, quota, { modelKey }));
+          });
+        }
+        break;
+
       default:
         // Generic fallback for unknown providers
         if (data.quotas) {
@@ -211,8 +288,31 @@ export function parseQuotaData(provider, data) {
 }
 
 /**
+ * Resolve the best available plan label using live usage first, then persisted
+ * provider-specific connection metadata.
+ */
+export function resolvePlanValue(plan, providerSpecificData) {
+  const psd = toRecord(providerSpecificData);
+  const candidates = [
+    plan,
+    psd.workspacePlanType,
+    psd.plan,
+    psd.subscription,
+    psd.tier,
+    psd.accountTier,
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizePlanCandidate(candidate);
+    if (normalized) return normalized;
+  }
+
+  return null;
+}
+
+/**
  * Normalize provider-specific plan labels into a shared tier taxonomy.
- * Supported tiers: enterprise, business, team, ultra, pro, free, unknown.
+ * Supported tiers: enterprise, business, team, ultra, pro, plus, free, unknown.
  */
 export function normalizePlanTier(plan) {
   const raw = typeof plan === "string" ? plan.trim() : "";
@@ -222,8 +322,13 @@ export function normalizePlanTier(plan) {
 
   const upper = raw.toUpperCase();
 
+  // Provider names that are not real plan tiers — treat as unknown
+  if (PROVIDER_PLAN_FALLBACKS.has(raw.toLowerCase())) {
+    return { key: "unknown", label: "Unknown", variant: "default", rank: 0, raw };
+  }
+
   if (upper.includes("PRO+") || upper.includes("PRO PLUS") || upper.includes("PROPLUS")) {
-    return { key: "plus", label: "Pro+", variant: "secondary", rank: 4, raw };
+    return { key: "plus", label: "Pro+", variant: "success", rank: 4, raw };
   }
 
   if (upper.includes("ENTERPRISE") || upper.includes("CORP") || upper.includes("ORG")) {
@@ -240,7 +345,7 @@ export function normalizePlanTier(plan) {
   }
 
   if (upper.includes("STUDENT")) {
-    return { key: "pro", label: "Student", variant: "primary", rank: 3, raw };
+    return { key: "pro", label: "Student", variant: "success", rank: 3, raw };
   }
 
   if (upper.includes("ULTRA")) {
@@ -248,11 +353,11 @@ export function normalizePlanTier(plan) {
   }
 
   if (upper.includes("PRO") || upper.includes("PREMIUM")) {
-    return { key: "pro", label: "Pro", variant: "primary", rank: 3, raw };
+    return { key: "pro", label: "Pro", variant: "success", rank: 3, raw };
   }
 
   if (upper.includes("PLUS") || upper.includes("PAID")) {
-    return { key: "plus", label: "Plus", variant: "secondary", rank: 2, raw };
+    return { key: "plus", label: "Plus", variant: "success", rank: 2, raw };
   }
 
   if (

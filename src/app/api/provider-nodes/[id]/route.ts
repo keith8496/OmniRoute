@@ -7,6 +7,7 @@ import {
   updateProviderConnection,
   updateProviderNode,
 } from "@/models";
+import { isClaudeCodeCompatibleProvider } from "@/shared/constants/providers";
 import { updateProviderNodeSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
@@ -14,6 +15,20 @@ type JsonRecord = Record<string, unknown>;
 
 function asRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
+}
+
+function sanitizeAnthropicBaseUrl(baseUrl: string) {
+  return (baseUrl || "")
+    .trim()
+    .replace(/\/$/, "")
+    .replace(/\/messages(?:\?[^#]*)?$/i, "");
+}
+
+function sanitizeClaudeCodeCompatibleBaseUrl(baseUrl: string) {
+  return (baseUrl || "")
+    .trim()
+    .replace(/\/$/, "")
+    .replace(/\/(?:v\d+\/)?messages(?:\?[^#]*)?$/i, "");
 }
 
 // PUT /api/provider-nodes/[id] - Update provider node
@@ -58,10 +73,9 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
 
     // Sanitize Base URL for Anthropic Compatible
     if (node.type === "anthropic-compatible") {
-      sanitizedBaseUrl = sanitizedBaseUrl.replace(/\/$/, "");
-      if (sanitizedBaseUrl.endsWith("/messages")) {
-        sanitizedBaseUrl = sanitizedBaseUrl.slice(0, -9); // remove /messages
-      }
+      sanitizedBaseUrl = isClaudeCodeCompatibleProvider(id)
+        ? sanitizeClaudeCodeCompatibleBaseUrl(sanitizedBaseUrl)
+        : sanitizeAnthropicBaseUrl(sanitizedBaseUrl);
     }
 
     const updates: Record<string, unknown> = {
@@ -69,7 +83,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       prefix: prefix.trim(),
       baseUrl: sanitizedBaseUrl,
       chatPath: chatPath || null,
-      modelsPath: modelsPath || null,
+      modelsPath: isClaudeCodeCompatibleProvider(id) ? null : modelsPath || null,
     };
 
     if (node.type === "openai-compatible") {
@@ -91,8 +105,12 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
           baseUrl: sanitizedBaseUrl,
           nodeName: updated.name,
           chatPath: updated.chatPath || undefined,
-          modelsPath: updated.modelsPath || undefined,
         } as JsonRecord;
+        if (updated.modelsPath) {
+          providerSpecificData.modelsPath = updated.modelsPath;
+        } else {
+          delete providerSpecificData.modelsPath;
+        }
         if (node.type === "openai-compatible") {
           providerSpecificData.apiType = apiType;
         }

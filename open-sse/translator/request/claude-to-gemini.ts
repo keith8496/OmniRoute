@@ -93,7 +93,6 @@ export function claudeToGeminiRequest(model, body, stream) {
 
             case "tool_use":
               parts.push({
-                thoughtSignature: DEFAULT_THINKING_GEMINI_SIGNATURE,
                 functionCall: {
                   id: block.id,
                   name: block.name,
@@ -145,6 +144,24 @@ export function claudeToGeminiRequest(model, body, stream) {
       if (parts.length > 0) {
         // Map Claude roles to Gemini roles
         const geminiRole = msg.role === "assistant" ? "model" : "user";
+
+        // Gemini 3+ expects the signature on the first functionCall part in a tool-call
+        // batch. If the assistant turn had no explicit thinking block, inject a fallback
+        // signature into that first functionCall. (#927)
+        if (geminiRole === "model") {
+          const hasFunctionCall = parts.some((p) => p.functionCall);
+          const hasSignature = parts.some((p) => p.thoughtSignature);
+          if (hasFunctionCall && !hasSignature) {
+            const fcIndex = parts.findIndex((p) => p.functionCall);
+            if (fcIndex >= 0) {
+              parts[fcIndex] = {
+                ...parts[fcIndex],
+                thoughtSignature: DEFAULT_THINKING_GEMINI_SIGNATURE,
+              };
+            }
+          }
+        }
+
         result.contents.push({ role: geminiRole, parts });
       }
     }
@@ -173,7 +190,7 @@ export function claudeToGeminiRequest(model, body, stream) {
   if (body.thinking?.type === "enabled" && body.thinking.budget_tokens) {
     result.generationConfig.thinkingConfig = {
       thinkingBudget: body.thinking.budget_tokens,
-      include_thoughts: true,
+      includeThoughts: true,
     };
   }
 
