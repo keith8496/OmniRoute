@@ -102,6 +102,14 @@ export const EMBEDDING_PROVIDERS: Record<string, EmbeddingProvider> = {
     authHeader: "bearer",
     models: [{ id: "nvidia/nv-embedqa-e5-v5", name: "NV EmbedQA E5 v5", dimensions: 1024 }],
   },
+  
+  github: {
+    id: "github",
+    baseUrl: "https://models.github.ai/inference/embeddings",
+    authType: "apikey",
+    authHeader: "bearer",
+    models: [{ id: "openai/text-embedding-3-small", name: "OpenAI: Text Embedding 3 Small", dimensions: 1536 }]
+  },
 
   openrouter: {
     id: "openrouter",
