@@ -14,6 +14,7 @@ import { stripTrailingSlashes } from "../utils/urlSanitize.ts";
  * - ElevenLabs: POST { text, model_id } to /v1/text-to-speech/{voice_id}
  * - Nvidia NIM: POST { input: { text }, voice, model } → audio binary
  * - HuggingFace Inference: POST { inputs: text } to /models/{model_id}
+ * - Edge TTS: POST SSML to Bing read-aloud endpoint (no auth)
  * - Coqui TTS: POST { text, speaker_id } → WAV audio (local, no auth)
  * - Tortoise TTS: POST { text, voice } → audio binary (local, no auth)
  */
@@ -82,6 +83,51 @@ function getStringValue(value): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+interface EdgeTtsToken {
+  token: string;
+  key: string;
+  cookie: string;
+}
+
+let edgeTtsTokenCache: EdgeTtsToken | null = null;
+
+function escapeSsml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+async function getEdgeTtsToken(): Promise<EdgeTtsToken> {
+  if (edgeTtsTokenCache) return edgeTtsTokenCache;
+
+  const res = await fetch("https://www.bing.com/translator", {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`Edge TTS token request failed (${res.status})`);
+  }
+
+  const html = await res.text();
+  const match = html.match(/params_AbusePreventionHelper\s*=\s*\[\s*"([^\"]+)"\s*,\s*"([^\"]+)"/);
+  if (!match?.[1] || !match?.[2]) {
+    throw new Error("Unable to extract Edge TTS token");
+  }
+
+  edgeTtsTokenCache = {
+    token: match[1],
+    key: match[2],
+    cookie: res.headers.get("set-cookie") || "",
+  };
+  return edgeTtsTokenCache;
+}
+
 function getAwsPollyProviderData(credentials) {
   return credentials?.providerSpecificData &&
     typeof credentials.providerSpecificData === "object" &&
@@ -148,6 +194,62 @@ function getAwsPollySampleRate(responseFormat, sampleRate) {
   if (outputFormat === "ogg_opus") return "48000";
   if (outputFormat === "pcm") return "16000";
   return undefined;
+}
+
+async function fetchEdgeTtsAudio(
+  providerConfig,
+  body,
+  modelId: string | null,
+  tokenInfo: EdgeTtsToken
+) {
+  const voice = getStringValue(body.voice) || getStringValue(modelId) || "en-US-AriaNeural";
+  if (!isValidPathSegment(voice)) {
+    return errorResponse(400, "Invalid voice ID");
+  }
+
+  const ssml =
+    `<speak version="1.0" xml:lang="en-US">` +
+    `<voice xml:lang="en-US" xml:gender="Female" name="${escapeSsml(voice)}">` +
+    `${escapeSsml(String(body.input))}</voice></speak>`;
+  const form = new URLSearchParams({
+    ssml,
+    token: tokenInfo.token,
+    key: tokenInfo.key,
+  });
+
+  return fetch(`${providerConfig.baseUrl}?isVertical=1&&IG=1&IID=translator.5023&SFX=1`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "audio/mpeg",
+      Origin: "https://www.bing.com",
+      Referer: "https://www.bing.com/translator",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+      ...(tokenInfo.cookie ? { Cookie: tokenInfo.cookie } : {}),
+    },
+    body: form.toString(),
+  });
+}
+
+/**
+ * Handle Microsoft Edge/Bing read-aloud TTS (no auth, returns binary audio).
+ */
+async function handleEdgeTtsSpeech(providerConfig, body, modelId) {
+  let tokenInfo = await getEdgeTtsToken();
+  let res = await fetchEdgeTtsAudio(providerConfig, body, modelId, tokenInfo);
+
+  if (res.status === 403 || res.status === 429) {
+    edgeTtsTokenCache = null;
+    tokenInfo = await getEdgeTtsToken();
+    res = await fetchEdgeTtsAudio(providerConfig, body, modelId, tokenInfo);
+  }
+
+  if (!res.ok) {
+    return upstreamErrorResponse(res, await res.text());
+  }
+
+  return audioStreamResponse(res);
 }
 
 /**
@@ -556,7 +658,7 @@ export async function handleAudioSpeech({
   if (!providerConfig) {
     return errorResponse(
       400,
-      `No speech provider found for model "${body.model}". Use format provider/model. Available: openai, hyperbolic, deepgram, nvidia, elevenlabs, huggingface, inworld, cartesia, playht, aws-polly, coqui, tortoise, qwen`
+      `No speech provider found for model "${body.model}". Use format provider/model. Available: openai, hyperbolic, deepgram, nvidia, elevenlabs, huggingface, edge-tts, inworld, cartesia, playht, aws-polly, coqui, tortoise, qwen`
     );
   }
 
@@ -587,6 +689,10 @@ export async function handleAudioSpeech({
 
     if (providerConfig.format === "huggingface-tts") {
       return handleHuggingFaceTtsSpeech(providerConfig, body, modelId, token);
+    }
+
+    if (providerConfig.format === "edge-tts") {
+      return handleEdgeTtsSpeech(providerConfig, body, modelId);
     }
 
     if (providerConfig.format === "inworld") {

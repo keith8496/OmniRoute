@@ -546,3 +546,91 @@ test("handleAudioSpeech returns a 500 when the provider request throws", async (
     globalThis.fetch = originalFetch;
   }
 });
+
+test("handleAudioSpeech routes Edge TTS without credentials and posts SSML", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; headers?: any; body?: string }> = [];
+
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), headers: options.headers, body: String(options.body || "") });
+
+    if (String(url) === "https://www.bing.com/translator") {
+      return new Response('params_AbusePreventionHelper = ["edge-token", "edge-key"]', {
+        status: 200,
+        headers: { "set-cookie": "BING=abc" },
+      });
+    }
+
+    return new Response(new Uint8Array([5, 4, 3]), {
+      status: 200,
+      headers: { "content-type": "audio/mpeg" },
+    });
+  };
+
+  try {
+    const response = await handleAudioSpeech({
+      body: {
+        model: "edge-tts/en-US-AriaNeural",
+        input: "Edge <hello> & world",
+      },
+      credentials: null,
+    });
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].url, "https://www.bing.com/translator");
+    assert.match(calls[1].url, /^https:\/\/www\.bing\.com\/tfettts\?/);
+    assert.equal(calls[1].headers.Cookie, "BING=abc");
+    const form = new URLSearchParams(calls[1].body);
+    assert.equal(form.get("token"), "edge-token");
+    assert.equal(form.get("key"), "edge-key");
+    assert.match(form.get("ssml") || "", /name="en-US-AriaNeural"/);
+    assert.match(form.get("ssml") || "", /Edge &lt;hello&gt; &amp; world/);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "audio/mpeg");
+    assert.deepEqual(Array.from(new Uint8Array(await response.arrayBuffer())), [5, 4, 3]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleAudioSpeech refreshes Edge TTS token once on rate limit", async () => {
+  const originalFetch = globalThis.fetch;
+  let translatorCalls = 0;
+  let synthCalls = 0;
+
+  globalThis.fetch = async (url, _options = {}) => {
+    if (String(url) === "https://www.bing.com/translator") {
+      translatorCalls += 1;
+      return new Response(
+        `params_AbusePreventionHelper = ["edge-token-${translatorCalls}", "edge-key-${translatorCalls}"]`,
+        { status: 200 }
+      );
+    }
+
+    synthCalls += 1;
+    if (synthCalls === 1) {
+      return new Response("limited", { status: 429 });
+    }
+
+    return new Response(new Uint8Array([9, 9]), {
+      status: 200,
+      headers: { "content-type": "audio/mpeg" },
+    });
+  };
+
+  try {
+    const response = await handleAudioSpeech({
+      body: {
+        model: "edge-tts/en-US-GuyNeural",
+        input: "retry me",
+      },
+      credentials: null,
+    });
+
+    assert.ok(translatorCalls >= 1);
+    assert.equal(synthCalls, 2);
+    assert.equal(response.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

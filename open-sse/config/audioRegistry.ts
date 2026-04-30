@@ -173,6 +173,25 @@ export const AUDIO_SPEECH_PROVIDERS: Record<string, AudioProvider> = {
     ],
   },
 
+  "edge-tts": {
+    id: "edge-tts",
+    // Unofficial Microsoft Edge/Bing read-aloud endpoint. No user API key required.
+    baseUrl: "https://www.bing.com/tfettts",
+    authType: "none",
+    authHeader: "none",
+    format: "edge-tts",
+    models: [
+      { id: "en-US-AriaNeural", name: "Edge Aria (US English)" },
+      { id: "en-US-GuyNeural", name: "Edge Guy (US English)" },
+      { id: "en-GB-SoniaNeural", name: "Edge Sonia (UK English)" },
+      { id: "en-AU-NatashaNeural", name: "Edge Natasha (AU English)" },
+      { id: "es-ES-ElviraNeural", name: "Edge Elvira (Spanish)" },
+      { id: "fr-FR-DeniseNeural", name: "Edge Denise (French)" },
+      { id: "de-DE-KatjaNeural", name: "Edge Katja (German)" },
+      { id: "ja-JP-NanamiNeural", name: "Edge Nanami (Japanese)" },
+    ],
+  },
+
   coqui: {
     id: "coqui",
     baseUrl: "http://localhost:5002/api/tts",
