@@ -70,7 +70,7 @@ const MODALITY_CONFIG: Record<
     placeholder: "Hello! Welcome to OmniRoute, your intelligent AI gateway...",
     color: "from-green-500 to-teal-500",
     textLabel: "Text",
-    needsCredentials: ["openai", "elevenlabs", "deepgram"],
+    needsCredentials: ["openai", "elevenlabs", "deepgram", "hyperbolic", "nvidia", "inworld", "cartesia", "playht", "huggingface"],
   },
   transcription: {
     icon: "mic",
@@ -182,6 +182,16 @@ const PROVIDER_MODELS: Record<
       name: "HuggingFace",
       models: [{ id: "huggingface/espnet/kan-bayashi_ljspeech_vits", name: "VITS LJSpeech" }],
     },
+    {
+      id: "edge-tts",
+      name: "Edge TTS",
+      models: [
+        { id: "edge-tts/en-US-AriaNeural", name: "Aria (US English)" },
+        { id: "edge-tts/en-US-GuyNeural", name: "Guy (US English)" },
+        { id: "edge-tts/en-GB-SoniaNeural", name: "Sonia (UK English)" },
+        { id: "edge-tts/en-AU-NatashaNeural", name: "Natasha (AU English)" },
+      ],
+    },
     { id: "qwen", name: "Qwen", models: [{ id: "qwen/qwen3-tts", name: "Qwen3 TTS" }] },
   ],
   transcription: [
@@ -266,6 +276,12 @@ const VOICE_PRESETS: Record<string, { id: string; label: string }[]> = {
     { id: "aura-stella-en", label: "Stella (EN)" },
     { id: "aura-zeus-en", label: "Zeus (EN)" },
     { id: "aura-orion-en", label: "Orion (EN)" },
+  ],
+  edge-tts: [
+    { id: "en-US-AriaNeural", label: "Aria (US English)" },
+    { id: "en-US-GuyNeural", label: "Guy (US English)" },
+    { id: "en-GB-SoniaNeural", label: "Sonia (UK English)" },
+    { id: "en-AU-NatashaNeural", label: "Natasha (AU English)" },
   ],
   inworld: [
     { id: "Eva", label: "Eva (EN)" },
