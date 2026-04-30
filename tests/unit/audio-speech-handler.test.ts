@@ -555,7 +555,7 @@ test("handleAudioSpeech routes Edge TTS without credentials and posts SSML", asy
     calls.push({ url: String(url), headers: options.headers, body: String(options.body || "") });
 
     if (String(url) === "https://www.bing.com/translator") {
-      return new Response('params_AbusePreventionHelper = ["edge-token", "edge-key"]', {
+      return new Response('params_AbusePreventionHelper = [1777573351123,"edge-token",3600000]', {
         status: 200,
         headers: { "set-cookie": "BING=abc" },
       });
@@ -582,7 +582,7 @@ test("handleAudioSpeech routes Edge TTS without credentials and posts SSML", asy
     assert.equal(calls[1].headers.Cookie, "BING=abc");
     const form = new URLSearchParams(calls[1].body);
     assert.equal(form.get("token"), "edge-token");
-    assert.equal(form.get("key"), "edge-key");
+    assert.equal(form.get("key"), "1777573351123");
     assert.match(form.get("ssml") || "", /name="en-US-AriaNeural"/);
     assert.match(form.get("ssml") || "", /Edge &lt;hello&gt; &amp; world/);
     assert.equal(response.status, 200);
@@ -602,7 +602,7 @@ test("handleAudioSpeech refreshes Edge TTS token once on rate limit", async () =
     if (String(url) === "https://www.bing.com/translator") {
       translatorCalls += 1;
       return new Response(
-        `params_AbusePreventionHelper = ["edge-token-${translatorCalls}", "edge-key-${translatorCalls}"]`,
+        `params_AbusePreventionHelper = [${1777573351123 + translatorCalls},"edge-token-${translatorCalls}",3600000]`,
         { status: 200 }
       );
     }

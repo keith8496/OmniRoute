@@ -115,14 +115,18 @@ async function getEdgeTtsToken(): Promise<EdgeTtsToken> {
   }
 
   const html = await res.text();
-  const match = html.match(/params_AbusePreventionHelper\s*=\s*\[\s*"([^\"]+)"\s*,\s*"([^\"]+)"/);
-  if (!match?.[1] || !match?.[2]) {
+  const match = html.match(
+    /params_AbusePreventionHelper\s*=\s*\[\s*(?:"([^"\\]+)"|(\d+))\s*,\s*"([^"\\]+)"/
+  );
+  const key = match?.[1] || match?.[2] || null;
+  const token = match?.[3] || null;
+  if (!key || !token) {
     throw new Error("Unable to extract Edge TTS token");
   }
 
   edgeTtsTokenCache = {
-    token: match[1],
-    key: match[2],
+    token,
+    key,
     cookie: res.headers.get("set-cookie") || "",
   };
   return edgeTtsTokenCache;
@@ -236,20 +240,24 @@ async function fetchEdgeTtsAudio(
  * Handle Microsoft Edge/Bing read-aloud TTS (no auth, returns binary audio).
  */
 async function handleEdgeTtsSpeech(providerConfig, body, modelId) {
-  let tokenInfo = await getEdgeTtsToken();
-  let res = await fetchEdgeTtsAudio(providerConfig, body, modelId, tokenInfo);
+  try {
+    let tokenInfo = await getEdgeTtsToken();
+    let res = await fetchEdgeTtsAudio(providerConfig, body, modelId, tokenInfo);
 
-  if (res.status === 403 || res.status === 429) {
-    edgeTtsTokenCache = null;
-    tokenInfo = await getEdgeTtsToken();
-    res = await fetchEdgeTtsAudio(providerConfig, body, modelId, tokenInfo);
+    if (res.status === 403 || res.status === 429) {
+      edgeTtsTokenCache = null;
+      tokenInfo = await getEdgeTtsToken();
+      res = await fetchEdgeTtsAudio(providerConfig, body, modelId, tokenInfo);
+    }
+
+    if (!res.ok) {
+      return upstreamErrorResponse(res, await res.text());
+    }
+
+    return audioStreamResponse(res);
+  } catch (err) {
+    return errorResponse(500, `Edge TTS request failed: ${err.message}`);
   }
-
-  if (!res.ok) {
-    return upstreamErrorResponse(res, await res.text());
-  }
-
-  return audioStreamResponse(res);
 }
 
 /**
