@@ -277,7 +277,7 @@ const VOICE_PRESETS: Record<string, { id: string; label: string }[]> = {
     { id: "aura-zeus-en", label: "Zeus (EN)" },
     { id: "aura-orion-en", label: "Orion (EN)" },
   ],
-  edge-tts: [
+  "edge-tts": [
     { id: "en-US-AriaNeural", label: "Aria (US English)" },
     { id: "en-US-GuyNeural", label: "Guy (US English)" },
     { id: "en-GB-SoniaNeural", label: "Sonia (UK English)" },
