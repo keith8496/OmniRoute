@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import Link from "next/link";
 import { IMAGE_PROVIDERS } from "@omniroute/open-sse/config/imageRegistry.ts";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
@@ -295,6 +295,35 @@ function getVoiceList(providerId: string) {
   return VOICE_PRESETS[providerId] ?? VOICE_PRESETS.default;
 }
 
+function getVoiceGroups(providerId: string, voices: { id: string; label: string }[], locale: string) {
+  if (providerId !== "edge-tts") return null;
+
+  const regionNames =
+    typeof Intl.DisplayNames === "function" ? new Intl.DisplayNames([locale], { type: "region" }) : null;
+  const languageNames =
+    typeof Intl.DisplayNames === "function" ? new Intl.DisplayNames([locale], { type: "language" }) : null;
+  const groups = new Map<string, { label: string; voices: { id: string; label: string }[] }>();
+
+  for (const voice of voices) {
+    const locale = voice.id.split("-").slice(0, 2).join("-");
+    const [languageCode = "", regionCode = ""] = locale.split("-");
+
+    let groupLabel = locale || "Other";
+    if (languageCode) {
+      const languageName = languageNames?.of(languageCode.toLowerCase()) || languageCode;
+      const regionName = regionCode ? regionNames?.of(regionCode.toUpperCase()) || regionCode : "";
+      groupLabel = regionName ? `${languageName} (${regionName})` : languageName;
+    }
+
+    if (!groups.has(locale)) {
+      groups.set(locale, { label: groupLabel, voices: [] });
+    }
+    groups.get(locale)?.voices.push(voice);
+  }
+
+  return Array.from(groups.values()).sort((a, b) => a.label.localeCompare(b.label));
+}
+
 /** Parse a human-readable error from the API error response */
 function parseApiError(raw: any, statusCode: number): { message: string; isCredentials: boolean } {
   const readErrorMessage = (value: any): string | null => {
@@ -419,6 +448,7 @@ function ImageResults({ data }: { data: any }) {
 
 export default function MediaPageClient() {
   const t = useTranslations("media");
+  const locale = useLocale();
   const [activeTab, setActiveTab] = useState<Modality>("image");
   const [prompt, setPrompt] = useState("");
 
@@ -665,6 +695,7 @@ export default function MediaPageClient() {
 
   const config = MODALITY_CONFIG[activeTab];
   const voiceList = getVoiceList(selectedProvider);
+  const voiceGroups = getVoiceGroups(selectedProvider, voiceList, locale);
   const isTopazImageFlow = activeTab === "image" && selectedProvider === "topaz";
   const isGenerateDisabled =
     loading ||
@@ -767,11 +798,21 @@ export default function MediaPageClient() {
                 onChange={(e) => setSpeechVoice(e.target.value)}
                 className="w-full px-3 py-2 rounded-lg bg-surface border border-black/10 dark:border-white/10 text-text-main text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
               >
-                {voiceList.map((v) => (
-                  <option key={v.id} value={v.id}>
-                    {v.label}
-                  </option>
-                ))}
+                {voiceGroups
+                  ? voiceGroups.map((group) => (
+                      <optgroup key={group.label} label={group.label}>
+                        {group.voices.map((v) => (
+                          <option key={v.id} value={v.id}>
+                            {v.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))
+                  : voiceList.map((v) => (
+                      <option key={v.id} value={v.id}>
+                        {v.label}
+                      </option>
+                    ))}
               </select>
             </div>
             <div>
