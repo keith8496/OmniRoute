@@ -342,14 +342,23 @@ function getVoiceGroups(providerId: string, voices: { id: string; label: string 
     typeof Intl.DisplayNames === "function" ? new Intl.DisplayNames([locale], { type: "language" }) : null;
   const groups = new Map<string, { label: string; voices: { id: string; label: string }[] }>();
 
+  const safeDisplayName = (displayNames: Intl.DisplayNames | null, value: string) => {
+    if (!displayNames || !value) return "";
+    try {
+      return displayNames.of(value) || "";
+    } catch {
+      return "";
+    }
+  };
+
   for (const voice of voices) {
     const locale = voice.id.split("-").slice(0, 2).join("-");
     const [languageCode = "", regionCode = ""] = locale.split("-");
 
     let groupLabel = locale || "Other";
     if (languageCode) {
-      const languageName = languageNames?.of(languageCode.toLowerCase()) || languageCode;
-      const regionName = regionCode ? regionNames?.of(regionCode.toUpperCase()) || regionCode : "";
+      const languageName = safeDisplayName(languageNames, languageCode.toLowerCase()) || languageCode;
+      const regionName = regionCode ? safeDisplayName(regionNames, regionCode.toUpperCase()) || regionCode : "";
       groupLabel = regionName ? `${languageName} (${regionName})` : languageName;
     }
 
