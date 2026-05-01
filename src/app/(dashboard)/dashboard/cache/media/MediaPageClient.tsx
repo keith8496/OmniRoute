@@ -7,6 +7,8 @@ import { IMAGE_PROVIDERS } from "@omniroute/open-sse/config/imageRegistry.ts";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
 
 type Modality = "image" | "video" | "music" | "speech" | "transcription";
+type VoiceOption = { id: string; label: string };
+
 type GenerationResult = {
   type: Modality;
   data: any;
@@ -464,6 +466,7 @@ export default function MediaPageClient() {
   // Speech-specific
   const [speechVoice, setSpeechVoice] = useState("alloy");
   const [speechFormat, setSpeechFormat] = useState("mp3");
+  const [edgeVoices, setEdgeVoices] = useState<VoiceOption[]>([]);
 
   // Transcription-specific
   const MAX_TRANSCRIPTION_FILE_SIZE = 4 * 1024 * 1024 * 1024; // 4 GB
@@ -527,7 +530,10 @@ export default function MediaPageClient() {
     const providers = PROVIDER_MODELS[tab] ?? [];
     const firstProvider = providers[0];
     setSelectedProvider(firstProvider?.id ?? "");
-    const firstModel = firstProvider?.models[0]?.id ?? "";
+    const firstModel =
+      tab === "speech" && firstProvider?.id === "edge-tts"
+        ? "edge-tts/default"
+        : firstProvider?.models[0]?.id ?? "";
     setSelectedModel(firstModel);
     if (tab === "speech") {
       setSpeechVoice(getVoiceList(firstProvider?.id ?? "")[0]?.id ?? "alloy");
@@ -537,7 +543,7 @@ export default function MediaPageClient() {
   const handleProviderChange = (providerId: string) => {
     setSelectedProvider(providerId);
     const models = PROVIDER_MODELS[activeTab]?.find((p) => p.id === providerId)?.models ?? [];
-    const firstModel = models[0]?.id ?? "";
+    const firstModel = providerId === "edge-tts" ? "edge-tts/default" : models[0]?.id ?? "";
     setSelectedModel(firstModel);
     if (activeTab === "speech") {
       setSpeechVoice(getVoiceList(providerId)[0]?.id ?? "alloy");
@@ -554,6 +560,32 @@ export default function MediaPageClient() {
     setSelectedModel(firstProvider?.models[0]?.id ?? "");
   }
 
+
+  useEffect(() => {
+    if (activeTab !== "speech" || selectedProvider !== "edge-tts") return;
+
+    let cancelled = false;
+    fetch("/api/media/edge-tts/voices")
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled) return;
+        if (!Array.isArray(data?.voices) || data.voices.length === 0) return;
+
+        const mapped: VoiceOption[] = data.voices
+          .filter((v: any) => typeof v?.id === "string" && typeof v?.label === "string")
+          .map((v: any) => ({ id: v.id, label: v.label }));
+
+        if (mapped.length === 0) return;
+        setEdgeVoices(mapped);
+        setSpeechVoice((current) => (mapped.some((v) => v.id === current) ? current : mapped[0].id));
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, selectedProvider]);
+
   const handleGenerate = async () => {
     setLoading(true);
     setError(null);
@@ -562,7 +594,10 @@ export default function MediaPageClient() {
 
     try {
       const config = MODALITY_CONFIG[activeTab];
-      const modelId = selectedModel;
+      const modelId =
+        activeTab === "speech" && selectedProvider === "edge-tts"
+          ? `edge-tts/${speechVoice}`
+          : selectedModel;
       const promptValue = prompt.trim();
 
       if (activeTab === "speech") {
@@ -694,7 +729,8 @@ export default function MediaPageClient() {
   };
 
   const config = MODALITY_CONFIG[activeTab];
-  const voiceList = getVoiceList(selectedProvider);
+  const voiceList =
+    selectedProvider === "edge-tts" && edgeVoices.length > 0 ? edgeVoices : getVoiceList(selectedProvider);
   const voiceGroups = getVoiceGroups(selectedProvider, voiceList, locale);
   const isTopazImageFlow = activeTab === "image" && selectedProvider === "topaz";
   const isGenerateDisabled =
@@ -765,11 +801,15 @@ export default function MediaPageClient() {
               onChange={(e) => setSelectedModel(e.target.value)}
               className="w-full px-3 py-2 rounded-lg bg-surface border border-black/10 dark:border-white/10 text-text-main text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
             >
-              {currentModels.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name}
-                </option>
-              ))}
+              {activeTab === "speech" && selectedProvider === "edge-tts" ? (
+                <option value="edge-tts/default">Default</option>
+              ) : (
+                currentModels.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name}
+                  </option>
+                ))
+              )}
             </select>
           </div>
         </div>
